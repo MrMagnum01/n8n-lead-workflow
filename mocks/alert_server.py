@@ -6,6 +6,12 @@ real Slack or email is used anywhere in this demo. Stdlib-only HTTP
 server, 127.0.0.1 only. Appends each alert to a JSON array file, written
 atomically (temp file + os.replace) on every write, same pattern as the
 CRM mock, so the file is never observed half-written.
+
+Supports an outage toggle (POST /admin/outage) so the test harness can
+simulate the alert sink being down (a 503, not recorded) -- exercised by
+the workflow's Send Alert retry and its distinct
+"accepted_notification_failed" response, which must never be confused
+with the ordinary 200 "accepted" response.
 """
 from __future__ import annotations
 
@@ -19,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOCK = threading.Lock()
 STATE_PATH: str = ""
+OUTAGE = {"on": False}
 
 
 def _now() -> str:
@@ -73,14 +80,24 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 alerts = _load()
             self._send_json(200, {"alerts": alerts})
+        elif self.path == "/admin/outage":
+            self._send_json(200, {"on": OUTAGE["on"]})
         elif self.path == "/health":
             self._send_json(200, {"ok": True})
         else:
             self._send_json(404, {"error": "not_found"})
 
     def do_POST(self):
+        if self.path == "/admin/outage":
+            body = self._read_json()
+            OUTAGE["on"] = bool(body.get("on", False))
+            self._send_json(200, {"on": OUTAGE["on"]})
+            return
         if self.path != "/alert":
             self._send_json(404, {"error": "not_found"})
+            return
+        if OUTAGE["on"]:
+            self._send_json(503, {"error": "alert_outage", "detail": "mock alert sink is simulating an outage"})
             return
         body = self._read_json()
         with LOCK:

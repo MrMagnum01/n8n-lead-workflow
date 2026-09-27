@@ -39,12 +39,17 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW_PATH = os.path.join(REPO_ROOT, "workflow", "lead-intake.json")
 N8N_IMAGE = "docker.io/n8nio/n8n:1.114.3"
-CONTAINER_NAME = "n8n-lead-workflow-demo"
+# Per-run container name (not a fixed constant): two concurrent rehearsals
+# must not be able to remove each other's container. `podman rm -f` below
+# is still safe -- it can only ever match THIS run's own never-before-used
+# name -- rather than a collision-prone fixed name shared across runs.
+CONTAINER_NAME_PREFIX = "n8n-lead-workflow-demo"
 
 FAILURES: list[str] = []
 
@@ -109,6 +114,7 @@ class Env:
     crm_state: str
     alert_state: str
     n8n_data_dir: str
+    container_name: str
     procs: list = field(default_factory=list)
 
 
@@ -134,9 +140,9 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 
 def start_n8n(env: Env) -> None:
-    subprocess.run(["podman", "rm", "-f", CONTAINER_NAME], capture_output=True)
+    subprocess.run(["podman", "rm", "-f", env.container_name], capture_output=True)
     r = run([
-        "podman", "run", "-d", "--name", CONTAINER_NAME,
+        "podman", "run", "-d", "--name", env.container_name,
         "--network=host",
         "-e", "N8N_LISTEN_ADDRESS=127.0.0.1",
         "-e", f"N8N_PORT={env.n8n_port}",
@@ -158,19 +164,19 @@ def start_n8n(env: Env) -> None:
     ok = wait_http_ok(f"http://127.0.0.1:{env.n8n_port}/healthz", timeout_s=60)
     check(ok, "n8n container became healthy")
     if not ok:
-        print(run(["podman", "logs", CONTAINER_NAME]).stdout[-4000:])
+        print(run(["podman", "logs", env.container_name]).stdout[-4000:])
         raise SystemExit("n8n never became healthy; aborting")
 
-    r = run(["podman", "cp", WORKFLOW_PATH, f"{CONTAINER_NAME}:/tmp/lead-intake.json"])
+    r = run(["podman", "cp", WORKFLOW_PATH, f"{env.container_name}:/tmp/lead-intake.json"])
     check(r.returncode == 0, "copied workflow json into container")
 
-    r = run(["podman", "exec", CONTAINER_NAME, "n8n", "import:workflow", "--input=/tmp/lead-intake.json"])
+    r = run(["podman", "exec", env.container_name, "n8n", "import:workflow", "--input=/tmp/lead-intake.json"])
     check(r.returncode == 0, "n8n import:workflow succeeded")
     if r.returncode != 0:
         print(r.stdout, r.stderr)
         raise SystemExit("import:workflow failed; aborting")
 
-    r = run(["podman", "exec", CONTAINER_NAME, "n8n", "list:workflow"])
+    r = run(["podman", "exec", env.container_name, "n8n", "list:workflow"])
     check(r.returncode == 0, "n8n list:workflow succeeded")
     wf_id = None
     for line in r.stdout.strip().splitlines():
@@ -182,7 +188,7 @@ def start_n8n(env: Env) -> None:
     if wf_id is None:
         raise SystemExit("workflow id not found after import; aborting")
 
-    r = run(["podman", "exec", CONTAINER_NAME, "n8n", "update:workflow", f"--id={wf_id}", "--active=true"])
+    r = run(["podman", "exec", env.container_name, "n8n", "update:workflow", f"--id={wf_id}", "--active=true"])
     check(r.returncode == 0, "n8n update:workflow --active=true succeeded")
 
     # Restarting registers the webhook route for the now-active workflow.
@@ -190,7 +196,7 @@ def start_n8n(env: Env) -> None:
     # restart; retry a few times.
     restarted = False
     for _ in range(6):
-        r = run(["podman", "restart", CONTAINER_NAME])
+        r = run(["podman", "restart", env.container_name])
         if r.returncode == 0:
             restarted = True
             break
@@ -215,7 +221,7 @@ def start_n8n(env: Env) -> None:
 
 
 def teardown(env: Env) -> None:
-    subprocess.run(["podman", "rm", "-f", CONTAINER_NAME], capture_output=True)
+    subprocess.run(["podman", "rm", "-f", env.container_name], capture_output=True)
     for p in env.procs:
         p.terminate()
     for p in env.procs:
@@ -267,6 +273,7 @@ def main() -> int:
         crm_state=os.path.join(tmp_root, "crm_state.json"),
         alert_state=os.path.join(tmp_root, "alerts.json"),
         n8n_data_dir=os.path.join(tmp_root, "n8n-data"),
+        container_name=f"{CONTAINER_NAME_PREFIX}-{uuid.uuid4().hex[:10]}",
     )
     os.makedirs(env.n8n_data_dir, exist_ok=True)
     # The n8n image runs as its own in-container "node" uid, which does not
@@ -290,6 +297,7 @@ def main() -> int:
         expected_rejected = 0
         expected_dead_letter = 0
         expected_accepted_events = 0  # each accepted send is one upsert event
+        expected_alert_fired = 0  # accepted sends where the alert sink itself succeeded
 
         # --- 1. valid leads, distinct emails ---
         valid_leads = [
@@ -301,6 +309,7 @@ def main() -> int:
             status, body = send_lead(env, lead)
             leads_in += 1
             expected_accepted_events += 1
+            expected_alert_fired += 1
             check(status == 200 and body.get("status") == "accepted", f"valid lead {lead['lead_id']} accepted (status={status}, body={body})")
 
         # --- 2. duplicate: resubmit L1's email under a new lead_id ---
@@ -308,6 +317,7 @@ def main() -> int:
         status, body = send_lead(env, dup)
         leads_in += 1
         expected_accepted_events += 1
+        expected_alert_fired += 1
         check(status == 200 and body.get("status") == "accepted", f"duplicate-email lead accepted (status={status}, body={body})")
 
         # --- 3. invalid leads: one per validation class ---
@@ -321,6 +331,10 @@ def main() -> int:
             ("bad_phone_format", {"lead_id": "I7", "name": "Bad Phone Fmt", "email": "v@example.com", "company": "Acme", "phone": "call-me-maybe"}),
             ("missing_lead_id", {"name": "No Lead Id", "email": "u@example.com", "company": "Acme"}),
             ("empty_company", {"lead_id": "I9", "name": "Empty Co", "email": "t@example.com", "company": "   "}),
+            # digits-required phone shape (MUST-FIX/NARROW 5): a punctuation-only
+            # string must not pass as a phone -- it has the right characters and
+            # length but not a single digit.
+            ("phone_no_digits", {"lead_id": "I10", "name": "No Digit Phone", "email": "s@example.com", "company": "Acme", "phone": "-------"}),
         ]
         for name, lead in invalid_cases:
             status, body = send_lead(env, lead)
@@ -354,7 +368,92 @@ def main() -> int:
         status, body = send_lead(env, recovered)
         leads_in += 1
         expected_accepted_events += 1
+        expected_alert_fired += 1
         check(status == 200 and body.get("status") == "accepted", f"post-outage lead accepted (status={status}, body={body})")
+
+        # --- 7. malformed enrichment response: HTTP 200 but body {} ---
+        # A vendor bug, not a transport error -- must not be accepted as a
+        # usable success. Categorised as its own dead-letter stage.
+        status, _ = http_json("POST", f"http://127.0.0.1:{env.enrich_port}/admin/malformed-once", {"on": True})
+        check(status == 200, "armed enrichment malformed-once")
+        me_lead = {"lead_id": "ME1", "name": "Malformed Enrich", "email": "me1@example.com", "company": "Bad Response Co"}
+        status, body = send_lead(env, me_lead)
+        leads_in += 1
+        expected_dead_letter += 1
+        check(status == 502 and body.get("status") == "dead_lettered" and body.get("stage") == "enrichment_response_invalid",
+              f"malformed-enrichment lead dead-lettered as enrichment_response_invalid, not accepted (status={status}, body={body})")
+
+        # --- 8. malformed CRM response: HTTP 200 but body {} (no write) ---
+        status, _ = http_json("POST", f"http://127.0.0.1:{env.crm_port}/admin/malformed-once", {"on": True})
+        check(status == 200, "armed CRM malformed-once")
+        mc_lead = {"lead_id": "MC1", "name": "Malformed CRM", "email": "mc1@example.com", "company": "Bad Response Co"}
+        status, body = send_lead(env, mc_lead)
+        leads_in += 1
+        expected_dead_letter += 1
+        check(status == 502 and body.get("status") == "dead_lettered" and body.get("stage") == "crm_response_invalid",
+              f"malformed-CRM-response lead dead-lettered as crm_response_invalid, not accepted (status={status}, body={body})")
+
+        # --- 9. idempotent retry: CRM commits the write but the ack is lost
+        #        (armed by /admin/drop-reply-once) -- the workflow's retry
+        #        must replay under the SAME idempotency key and land on the
+        #        cached result, not a second commit. This is the ambiguous-
+        #        retry case (MUST-FIX 3): leads_in == upserts+rejected+dead
+        #        -lettered must still hold, and upsert_count must stay 1. ---
+        status, _ = http_json("POST", f"http://127.0.0.1:{env.crm_port}/admin/drop-reply-once", {"on": True})
+        check(status == 200, "armed CRM drop-reply-once")
+        id_lead = {"lead_id": "ID1", "name": "Idempotent Retry", "email": "idem@example.com", "company": "Retry Co"}
+        status, body = send_lead(env, id_lead)
+        leads_in += 1
+        expected_accepted_events += 1
+        expected_alert_fired += 1
+        check(status == 200 and body.get("status") == "accepted", f"ack-lost-then-retried lead still accepted exactly once (status={status}, body={body})")
+
+        # --- 10. alert sink outage: CRM upsert succeeds, alert delivery
+        #        fails after retries -- MUST-FIX 2: this must NOT continue
+        #        on the success edge; response must be non-200 with an
+        #        explicit notification-failed status, contact still saved. ---
+        toggle_outage(env.alert_port, True)
+        al_lead = {"lead_id": "AL1", "name": "Alert Failure", "email": "alertfail@example.com", "company": "Notify Co"}
+        status, body = send_lead(env, al_lead)
+        leads_in += 1
+        expected_accepted_events += 1  # CRM write still committed
+        check(status != 200 and body.get("status") == "accepted_notification_failed" and body.get("crm_contact", {}).get("email") == "alertfail@example.com",
+              f"alert-outage lead: CRM accepted but response is non-200/failed, not silent success (status={status}, body={body})")
+        toggle_outage(env.alert_port, False)
+
+        # --- 11. recording-store outage: MUST-FIX 1. If /rejected or
+        #        /dead-letter itself cannot be written, the response must
+        #        say so truthfully -- never the normal rejected/dead_lettered
+        #        success shape implying a row was recorded. Run against a
+        #        dedicated toggle so the CRM's main outage semantics (which
+        #        deliberately leave /rejected and /dead-letter reachable)
+        #        are untouched. These two leads are intentionally excluded
+        #        from leads_in/expected_* below: by design nothing is
+        #        recorded for them -- that is the behaviour under test. ---
+        status, _ = http_json("POST", f"http://127.0.0.1:{env.crm_port}/admin/recording-outage", {"on": True})
+        check(status == 200, "armed CRM recording-outage")
+
+        pre_state = crm_state(env)
+        rj_lead = {"lead_id": "RJ1", "name": "Rejected Store Down", "company": "Acme"}  # missing email -> rejected
+        status, body = send_lead(env, rj_lead)
+        check(status == 502 and body.get("status") == "rejection_not_recorded",
+              f"rejection-store-down: truthful storage failure, not a normal 'rejected' response (status={status}, body={body})")
+
+        toggle_outage(env.enrich_port, True)  # force dead-letter path too
+        dl_lead = {"lead_id": "DL1", "name": "Dead Letter Store Down", "email": "dl1@example.com", "company": "Acme"}
+        status, body = send_lead(env, dl_lead)
+        check(status != 200 and body.get("status") == "dead_letter_not_recorded",
+              f"dead-letter-store-down: truthful storage failure, not a normal 'dead_lettered' response (status={status}, body={body})")
+        toggle_outage(env.enrich_port, False)
+
+        status, _ = http_json("POST", f"http://127.0.0.1:{env.crm_port}/admin/recording-outage", {"on": False})
+        check(status == 200, "disarmed CRM recording-outage")
+
+        post_state = crm_state(env)
+        check(len(post_state.get("rejected", [])) == len(pre_state.get("rejected", [])),
+              "rejection-store-down: no rejected row was actually recorded (no false durability claim)")
+        check(len(post_state.get("dead_letter", [])) == len(pre_state.get("dead_letter", [])),
+              "dead-letter-store-down: no dead-letter row was actually recorded (no false durability claim)")
 
         # --- reconciliation against CRM ground truth ---
         state = crm_state(env)
@@ -375,7 +474,12 @@ def main() -> int:
         ada = contacts.get("ada@example.com")
         check(ada is not None, "ada@example.com present in CRM contacts")
         check(ada is not None and ada.get("upsert_count") == 2, f"ada@example.com upsert_count == 2 (duplicate collapsed, not duplicated) (got {ada.get('upsert_count') if ada else None})")
-        check(len(contacts) == 4, f"exactly 4 distinct CRM contacts (3 valid + post-outage, dup collapsed) (got {len(contacts)})")
+        check(len(contacts) == 6, f"exactly 6 distinct CRM contacts (3 valid + post-outage + idempotent-retry + alert-failure, dup collapsed) (got {len(contacts)})")
+
+        # idempotent-retry lead: the lost-ack retry must NOT have double-committed
+        idem = contacts.get("idem@example.com")
+        check(idem is not None and idem.get("upsert_count") == 1,
+              f"idem@example.com upsert_count == 1 (retry under the same idempotency key did not write twice) (got {idem.get('upsert_count') if idem else None})")
 
         # rejected reasons spot-check
         rejected_by_id = {r.get("lead_id"): r for r in rejected}
@@ -384,18 +488,24 @@ def main() -> int:
         check("name_missing_or_invalid_type" in rejected_by_id.get("I5", {}).get("reasons", []), "I5 rejected: numeric name is not a valid string type")
         check("phone_invalid_type_or_format" in rejected_by_id.get("I6", {}).get("reasons", []), "I6 rejected: numeric phone is not a valid string type")
         check("phone_invalid_type_or_format" in rejected_by_id.get("I7", {}).get("reasons", []), "I7 rejected: malformed phone string")
+        check("phone_invalid_type_or_format" in rejected_by_id.get("I10", {}).get("reasons", []), "I10 rejected: punctuation-only phone has no digit")
 
         # dead-letter reason/stage spot-check
         dl_by_id = {d.get("lead_id"): d for d in dead_letter}
         check(dl_by_id.get("D1", {}).get("stage") == "enrichment", "D1 dead-lettered at enrichment stage")
         check(dl_by_id.get("D2", {}).get("stage") == "crm_upsert", "D2 dead-lettered at crm_upsert stage")
         check(dl_by_id.get("D1", {}).get("attempts") == 3, f"D1 exhausted 3 retry attempts (got {dl_by_id.get('D1', {}).get('attempts')})")
+        check(dl_by_id.get("ME1", {}).get("stage") == "enrichment_response_invalid", "ME1 dead-lettered at enrichment_response_invalid stage")
+        check(dl_by_id.get("MC1", {}).get("stage") == "crm_response_invalid", "MC1 dead-lettered at crm_response_invalid stage")
 
-        # alerts: fired for accepted leads only (4), never for rejected/dead-lettered
+        # alerts: fired only where CRM accepted AND the alert sink itself
+        # succeeded -- never for rejected/dead-lettered, and never claimed
+        # for the alert-outage lead whose notification genuinely failed
         fired = alerts(env)
         alert_lead_ids = {a.get("lead_id") for a in fired}
-        check(len(fired) == expected_accepted_events, f"alert fired once per accepted lead ({len(fired)} == {expected_accepted_events})")
-        check(alert_lead_ids == {"L1", "L2", "L3", "L1-DUP", "L4"}, f"alerts fired for exactly the accepted lead_ids (got {alert_lead_ids})")
+        check(len(fired) == expected_alert_fired, f"alert fired exactly where notification succeeded ({len(fired)} == {expected_alert_fired})")
+        check(alert_lead_ids == {"L1", "L2", "L3", "L1-DUP", "L4", "ID1"}, f"alerts fired for exactly the notification-succeeded lead_ids (got {alert_lead_ids})")
+        check("AL1" not in alert_lead_ids, "AL1 (alert-outage lead) never recorded a successful alert")
 
     finally:
         teardown(env)

@@ -10,6 +10,11 @@ No real enrichment vendor, network call, or data is involved anywhere.
 Supports an outage toggle (POST /admin/outage) so the test harness can
 simulate the enrichment vendor being down (a 503), exercised by the
 workflow's retry-with-backoff and dead-letter branch.
+
+Also supports POST /admin/malformed-once, a one-shot fault: the next
+/enrich call still returns HTTP 200, but with an empty body ({}) instead
+of the expected fields -- a vendor bug this pipeline must not treat as a
+usable success, distinct from a transport-level outage.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 OUTAGE = {"on": False}
+MALFORMED_ONCE = {"armed": False}
 
 INDUSTRIES = ["software", "retail", "manufacturing", "healthcare", "logistics", "finance"]
 SIZE_BANDS = ["1-10", "11-50", "51-200", "201-1000", "1000+"]
@@ -61,11 +67,20 @@ class Handler(BaseHTTPRequestHandler):
             OUTAGE["on"] = bool(body.get("on", False))
             self._send_json(200, {"on": OUTAGE["on"]})
             return
+        if self.path == "/admin/malformed-once":
+            body = self._read_json()
+            MALFORMED_ONCE["armed"] = bool(body.get("on", True))
+            self._send_json(200, {"armed": MALFORMED_ONCE["armed"]})
+            return
         if self.path != "/enrich":
             self._send_json(404, {"error": "not_found"})
             return
         if OUTAGE["on"]:
             self._send_json(503, {"error": "enrichment_outage", "detail": "mock enrichment vendor is simulating an outage"})
+            return
+        if MALFORMED_ONCE["armed"]:
+            MALFORMED_ONCE["armed"] = False
+            self._send_json(200, {})
             return
 
         body = self._read_json()
