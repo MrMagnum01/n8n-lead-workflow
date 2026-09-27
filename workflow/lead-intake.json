@@ -1,0 +1,348 @@
+{
+  "name": "lead-intake-pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "lead-intake-hook"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Strict input validation. Nothing here silently drops a lead: every\n// item leaves this node with valid=true or valid=false plus a reason,\n// and the IF node below routes both outcomes to somewhere recorded.\nconst body = $json.body || {};\n\nfunction isNonEmptyString(v) {\n  return typeof v === 'string' && v.trim().length > 0;\n}\n\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nconst PHONE_RE = /^\\+?[0-9()\\-.\\s]{7,20}$/;\n\nconst reasons = [];\n\n// name: required, string, non-empty after trim, sane max length\nif (!isNonEmptyString(body.name)) {\n  reasons.push('name_missing_or_invalid_type');\n} else if (body.name.trim().length > 200) {\n  reasons.push('name_too_long');\n}\n\n// email: required, must be a string, must match a real email shape\nif (typeof body.email !== 'string' || body.email.trim().length === 0) {\n  reasons.push('email_missing_or_invalid_type');\n} else if (!EMAIL_RE.test(body.email.trim())) {\n  reasons.push('email_format_invalid');\n}\n\n// company: required, string, non-empty\nif (!isNonEmptyString(body.company)) {\n  reasons.push('company_missing_or_invalid_type');\n} else if (body.company.trim().length > 200) {\n  reasons.push('company_too_long');\n}\n\n// phone: optional, but if present must be a string matching a phone shape\nif (body.phone !== undefined && body.phone !== null && body.phone !== '') {\n  if (typeof body.phone !== 'string' || !PHONE_RE.test(body.phone.trim())) {\n    reasons.push('phone_invalid_type_or_format');\n  }\n}\n\n// message: optional, but if present must be a string within a sane length\nif (body.message !== undefined && body.message !== null && body.message !== '') {\n  if (typeof body.message !== 'string') {\n    reasons.push('message_invalid_type');\n  } else if (body.message.length > 5000) {\n    reasons.push('message_too_long');\n  }\n}\n\n// lead_id: required, string, non-empty -- the source system's own id,\n// used as the idempotency/dedup key alongside email\nif (!isNonEmptyString(body.lead_id)) {\n  reasons.push('lead_id_missing_or_invalid_type');\n}\n\nconst valid = reasons.length === 0;\n\nreturn {\n  json: {\n    valid,\n    reasons,\n    lead_id: isNonEmptyString(body.lead_id) ? body.lead_id.trim() : null,\n    name: isNonEmptyString(body.name) ? body.name.trim() : null,\n    email: typeof body.email === 'string' ? body.email.trim().toLowerCase() : null,\n    company: isNonEmptyString(body.company) ? body.company.trim() : null,\n    phone: typeof body.phone === 'string' && body.phone.trim() ? body.phone.trim() : null,\n    message: typeof body.message === 'string' ? body.message : null,\n    received_at: new Date().toISOString()\n  }\n};"
+      },
+      "id": "validate",
+      "name": "Validate Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "valid-cond",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-valid",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CRM_URL }}/rejected",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ lead_id: $json.lead_id, email: $json.email, name: $json.name, company: $json.company, reasons: $json.reasons, received_at: $json.received_at }) }}",
+        "options": {
+          "timeout": 5000
+        },
+        "contentType": "json"
+      },
+      "id": "record-rejected",
+      "name": "Record Rejected",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        460
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 800,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'rejected', lead_id: $('Validate Lead').item.json.lead_id, reasons: $('Validate Lead').item.json.reasons }) }}",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "id": "respond-rejected",
+      "name": "Respond Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        880,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Orchestrates enrichment then CRM upsert for one validated lead, with\n// manual retry and exponential backoff on each external call. A\n// persistent failure at either stage never drops the lead silently --\n// it is returned with status='dead_lettered', the failing stage, and\n// the last error, so the branch below records it as a dead-letter row.\nconst lead = $json;\nconst ENRICH_URL = $env.ENRICH_URL;\nconst CRM_URL = $env.CRM_URL;\n\nasync function withRetry(fn, maxAttempts, baseDelayMs) {\n  let lastError = null;\n  let attempts = 0;\n  let delay = baseDelayMs;\n  while (attempts < maxAttempts) {\n    attempts += 1;\n    try {\n      const result = await fn();\n      return { ok: true, result, attempts };\n    } catch (err) {\n      lastError = (err && err.message) ? err.message : String(err);\n      if (attempts < maxAttempts) {\n        await new Promise((resolve) => setTimeout(resolve, delay));\n        delay *= 2; // exponential backoff: 200ms, 400ms, ...\n      }\n    }\n  }\n  return { ok: false, error: lastError, attempts };\n}\n\nconst enrichRes = await withRetry(\n  () => this.helpers.httpRequest({\n    method: 'POST',\n    url: `${ENRICH_URL}/enrich`,\n    body: { email: lead.email, company: lead.company },\n    json: true,\n    timeout: 2000\n  }),\n  3,\n  200\n);\n\nif (!enrichRes.ok) {\n  return {\n    json: {\n      ...lead,\n      status: 'dead_lettered',\n      stage: 'enrichment',\n      reason: enrichRes.error,\n      attempts: enrichRes.attempts\n    }\n  };\n}\n\nconst enrichment = enrichRes.result;\n\nconst crmRes = await withRetry(\n  () => this.helpers.httpRequest({\n    method: 'POST',\n    url: `${CRM_URL}/contacts`,\n    body: {\n      email: lead.email,\n      name: lead.name,\n      company: lead.company,\n      phone: lead.phone,\n      message: lead.message,\n      lead_id: lead.lead_id,\n      enrichment\n    },\n    json: true,\n    timeout: 2000\n  }),\n  3,\n  200\n);\n\nif (!crmRes.ok) {\n  return {\n    json: {\n      ...lead,\n      enrichment,\n      status: 'dead_lettered',\n      stage: 'crm_upsert',\n      reason: crmRes.error,\n      attempts: crmRes.attempts\n    }\n  };\n}\n\nreturn {\n  json: {\n    ...lead,\n    enrichment,\n    crm_contact: crmRes.result && crmRes.result.contact,\n    status: 'accepted'\n  }\n};"
+      },
+      "id": "enrich-and-upsert",
+      "name": "Enrich And Upsert (retry+backoff)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "accepted-cond",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "accepted",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-accepted",
+      "name": "Accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CRM_URL }}/dead-letter",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ lead_id: $json.lead_id, email: $json.email, name: $json.name, company: $json.company, stage: $json.stage, reason: $json.reason, attempts: $json.attempts, received_at: $json.received_at }) }}",
+        "options": {
+          "timeout": 5000
+        },
+        "contentType": "json"
+      },
+      "id": "record-dead-letter",
+      "name": "Record Dead Letter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        320
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 800,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'dead_lettered', lead_id: $('Enrich And Upsert (retry+backoff)').item.json.lead_id, stage: $('Enrich And Upsert (retry+backoff)').item.json.stage, reason: $('Enrich And Upsert (retry+backoff)').item.json.reason }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "id": "respond-dead-letter",
+      "name": "Respond Dead Lettered",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1320,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ALERT_URL }}/alert",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: 'new_lead', lead_id: $json.lead_id, email: $json.email, company: $json.company, fit_score: $json.enrichment ? $json.enrichment.fit_score : null }) }}",
+        "options": {
+          "timeout": 5000
+        },
+        "contentType": "json"
+      },
+      "id": "send-alert",
+      "name": "Send Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        140
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 200,
+        "responseBody": "={{ JSON.stringify({ status: 'accepted', lead_id: $('Enrich And Upsert (retry+backoff)').item.json.lead_id, crm_contact: $('Enrich And Upsert (retry+backoff)').item.json.crm_contact }) }}",
+        "options": {}
+      },
+      "id": "respond-accepted",
+      "name": "Respond Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1320,
+        140
+      ]
+    }
+  ],
+  "connections": {
+    "Lead Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Lead": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Enrich And Upsert (retry+backoff)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Rejected": {
+      "main": [
+        [
+          {
+            "node": "Respond Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich And Upsert (retry+backoff)": {
+      "main": [
+        [
+          {
+            "node": "Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Accepted?": {
+      "main": [
+        [
+          {
+            "node": "Send Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Dead Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Dead Letter": {
+      "main": [
+        [
+          {
+            "node": "Respond Dead Lettered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Alert": {
+      "main": [
+        [
+          {
+            "node": "Respond Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
