@@ -223,6 +223,15 @@ def teardown(env: Env) -> None:
             p.wait(timeout=5)
         except Exception:
             p.kill()
+    # Files n8n created inside the bind-mounted data dir are owned by
+    # rootless podman's mapped (sub-uid) owner, not this process's uid, so
+    # a plain rmtree silently leaves them behind. `podman unshare` re-enters
+    # that user namespace so removal actually works; fall back to a plain
+    # rmtree for anything outside the mount (or if podman unshare itself is
+    # unavailable) rather than leaking the whole tree.
+    r = subprocess.run(["podman", "unshare", "rm", "-rf", env.n8n_data_dir], capture_output=True)
+    if r.returncode != 0:
+        print(f"warning: podman unshare cleanup of {env.n8n_data_dir} failed: {r.stderr.decode(errors='replace')[:500]}")
     shutil.rmtree(env.tmp_root, ignore_errors=True)
 
 
