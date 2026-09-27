@@ -71,7 +71,7 @@
         "url": "={{ $env.CRM_URL }}/rejected",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ lead_id: $json.lead_id, email: $json.email, name: $json.name, company: $json.company, reasons: $json.reasons, received_at: $json.received_at }) }}",
+        "jsonBody": "={{ JSON.stringify({ record_key: 'rejected:' + $execution.id, lead_id: $json.lead_id, email: $json.email, name: $json.name, company: $json.company, reasons: $json.reasons, received_at: $json.received_at }) }}",
         "options": {
           "timeout": 5000
         },
@@ -110,7 +110,7 @@
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "// Orchestrates enrichment then CRM upsert for one validated lead, with\n// manual retry and exponential backoff on each external call. A\n// persistent TRANSPORT failure at either stage never drops the lead\n// silently -- it is returned with status='dead_lettered', the failing\n// stage, and the last error, so the branch below records it as a\n// dead-letter row.\n//\n// A malformed HTTP 200 (missing the fields this pipeline actually\n// depends on) is validated separately from transport failure and is\n// NOT retried -- retrying a response-validation failure risks repeating\n// a write that may already have committed upstream. It is returned as\n// its own dead_lettered stage instead, distinct from a transport error.\nconst lead = $json;\nconst ENRICH_URL = $env.ENRICH_URL;\nconst CRM_URL = $env.CRM_URL;\n\n// Stable idempotency key derived from the lead's own id (required and\n// validated upstream in Validate Lead). A transport retry of the CRM\n// upsert -- request sent, reply lost -- replays under the SAME key, so\n// the mock CRM can recognize it as the same logical write instead of a\n// new one and avoid a second upsert_count increment.\nconst idempotencyKey = `lead-${lead.lead_id}`;\n\nasync function withRetry(fn, maxAttempts, baseDelayMs) {\n  let lastError = null;\n  let attempts = 0;\n  let delay = baseDelayMs;\n  while (attempts < maxAttempts) {\n    attempts += 1;\n    try {\n      const result = await fn();\n      return { ok: true, result, attempts };\n    } catch (err) {\n      lastError = (err && err.message) ? err.message : String(err);\n      if (attempts < maxAttempts) {\n        await new Promise((resolve) => setTimeout(resolve, delay));\n        delay *= 2; // exponential backoff: 200ms, 400ms, ...\n      }\n    }\n  }\n  return { ok: false, error: lastError, attempts };\n}\n\nfunction isValidEnrichment(e) {\n  return !!e && typeof e === 'object' &&\n    typeof e.industry === 'string' && e.industry.trim().length > 0 &&\n    typeof e.company_size === 'string' && e.company_size.trim().length > 0 &&\n    typeof e.fit_score === 'number' && Number.isFinite(e.fit_score);\n}\n\nfunction isValidCrmContact(r) {\n  return !!r && typeof r === 'object' && r.status === 'ok' &&\n    !!r.contact && typeof r.contact === 'object' &&\n    typeof r.contact.email === 'string' && r.contact.email.trim().length > 0;\n}\n\nconst enrichRes = await withRetry(\n  () => this.helpers.httpRequest({\n    method: 'POST',\n    url: `${ENRICH_URL}/enrich`,\n    body: { email: lead.email, company: lead.company },\n    json: true,\n    timeout: 2000\n  }),\n  3,\n  200\n);\n\nif (!enrichRes.ok) {\n  return {\n    json: {\n      ...lead,\n      status: 'dead_lettered',\n      stage: 'enrichment',\n      reason: enrichRes.error,\n      attempts: enrichRes.attempts\n    }\n  };\n}\n\nconst enrichment = enrichRes.result;\n\nif (!isValidEnrichment(enrichment)) {\n  return {\n    json: {\n      ...lead,\n      enrichment,\n      status: 'dead_lettered',\n      stage: 'enrichment_response_invalid',\n      reason: 'enrichment response missing required fields (industry, company_size, fit_score)',\n      attempts: enrichRes.attempts\n    }\n  };\n}\n\nconst crmRes = await withRetry(\n  () => this.helpers.httpRequest({\n    method: 'POST',\n    url: `${CRM_URL}/contacts`,\n    body: {\n      email: lead.email,\n      name: lead.name,\n      company: lead.company,\n      phone: lead.phone,\n      message: lead.message,\n      lead_id: lead.lead_id,\n      idempotency_key: idempotencyKey,\n      enrichment\n    },\n    json: true,\n    timeout: 2000\n  }),\n  3,\n  200\n);\n\nif (!crmRes.ok) {\n  return {\n    json: {\n      ...lead,\n      enrichment,\n      status: 'dead_lettered',\n      stage: 'crm_upsert',\n      reason: crmRes.error,\n      attempts: crmRes.attempts\n    }\n  };\n}\n\nif (!isValidCrmContact(crmRes.result)) {\n  return {\n    json: {\n      ...lead,\n      enrichment,\n      status: 'dead_lettered',\n      stage: 'crm_response_invalid',\n      reason: 'CRM response missing status=ok or contact.email',\n      attempts: crmRes.attempts\n    }\n  };\n}\n\nreturn {\n  json: {\n    ...lead,\n    enrichment,\n    crm_contact: crmRes.result.contact,\n    status: 'accepted'\n  }\n};"
+        "jsCode": "// Orchestrates enrichment then CRM upsert for one validated lead, with\n// manual retry and exponential backoff on each external call. A\n// persistent TRANSPORT failure at either stage never drops the lead\n// silently -- it is returned with status='dead_lettered', the failing\n// stage, and the last error, so the branch below records it as a\n// dead-letter row.\n//\n// A malformed HTTP 200 (missing the fields this pipeline actually\n// depends on) is validated separately from transport failure and is\n// NOT retried -- retrying a response-validation failure risks repeating\n// a write that may already have committed upstream. It is returned as\n// its own dead_lettered stage instead, distinct from a transport error.\n//\n// Ambiguous CRM outcomes -- transport retries exhausted, or a malformed\n// 200 -- may still have committed upstream. Before classifying them the\n// node reconciles by idempotency key (GET /contacts/lookup): found ->\n// the write committed, reconcile to 'accepted'; confirmed absent ->\n// 'dead_lettered'; lookup itself failed -> 'outcome_unknown', recorded\n// separately and never counted as a failed intake.\n//\n// A well-formed 200 whose contact is a DIFFERENT lead (lead_id/email not\n// the ones submitted) is dead-lettered as crm_response_identity_mismatch\n// and never triggers an accepted notification.\nconst lead = $json;\nconst ENRICH_URL = $env.ENRICH_URL;\nconst CRM_URL = $env.CRM_URL;\n\n// Stable idempotency key derived from the lead's own id (required and\n// validated upstream in Validate Lead). A transport retry of the CRM\n// upsert -- request sent, reply lost -- replays under the SAME key, so\n// the mock CRM can recognize it as the same logical write instead of a\n// new one and avoid a second upsert_count increment.\nconst idempotencyKey = `lead-${lead.lead_id}`;\n\nasync function withRetry(fn, maxAttempts, baseDelayMs) {\n  let lastError = null;\n  let attempts = 0;\n  let delay = baseDelayMs;\n  while (attempts < maxAttempts) {\n    attempts += 1;\n    try {\n      const result = await fn();\n      return { ok: true, result, attempts };\n    } catch (err) {\n      lastError = (err && err.message) ? err.message : String(err);\n      if (attempts < maxAttempts) {\n        await new Promise((resolve) => setTimeout(resolve, delay));\n        delay *= 2; // exponential backoff: 200ms, 400ms, ...\n      }\n    }\n  }\n  return { ok: false, error: lastError, attempts };\n}\n\nfunction isValidEnrichment(e) {\n  return !!e && typeof e === 'object' &&\n    typeof e.industry === 'string' && e.industry.trim().length > 0 &&\n    typeof e.company_size === 'string' && e.company_size.trim().length > 0 &&\n    typeof e.fit_score === 'number' && Number.isFinite(e.fit_score);\n}\n\nfunction isWellFormedCrmContact(r) {\n  return !!r && typeof r === 'object' && r.status === 'ok' &&\n    !!r.contact && typeof r.contact === 'object' &&\n    typeof r.contact.email === 'string' && r.contact.email.trim().length > 0;\n}\n\n// Identity binding: the contact returned must be the lead we submitted.\nfunction isValidCrmContact(contact) {\n  return !!contact && typeof contact === 'object' &&\n    contact.lead_id === lead.lead_id &&\n    typeof contact.email === 'string' &&\n    contact.email.trim().toLowerCase() === lead.email;\n}\n\nfunction identityMismatch(contact, attempts) {\n  return {\n    json: {\n      ...lead,\n      enrichment,\n      crm_contact_rejected: contact,\n      status: 'dead_lettered',\n      stage: 'crm_response_identity_mismatch',\n      reason: 'crm_response_identity_mismatch: response contact lead_id/email do not match the submitted lead',\n      attempts\n    }\n  };\n}\n\n// Reconcile an ambiguous CRM outcome against the CRM's own record of\n// committed idempotency keys.\nasync function reconcile(stage, reason, attempts) {\n  const lookup = await withRetry(\n    () => this.helpers.httpRequest({\n      method: 'GET',\n      url: `${CRM_URL}/contacts/lookup?idempotency_key=${encodeURIComponent(idempotencyKey)}`,\n      json: true,\n      timeout: 2000\n    }),\n    2,\n    200\n  );\n  const r = lookup.ok ? lookup.result : null;\n  if (!r || typeof r !== 'object' || typeof r.found !== 'boolean' ||\n      (r.found && !isWellFormedCrmContact({ status: 'ok', contact: r.contact }))) {\n    return {\n      json: {\n        ...lead,\n        enrichment,\n        status: 'outcome_unknown',\n        stage,\n        reason: `${reason}; reconciliation lookup failed: ${lookup.ok ? 'malformed lookup response' : lookup.error}`,\n        attempts\n      }\n    };\n  }\n  if (r.found) {\n    if (!isValidCrmContact(r.contact)) return identityMismatch(r.contact, attempts);\n    return {\n      json: { ...lead, enrichment, crm_contact: r.contact, status: 'accepted', reconciled: true }\n    };\n  }\n  return {\n    json: { ...lead, enrichment, status: 'dead_lettered', stage, reason, attempts }\n  };\n}\n\nconst enrichRes = await withRetry(\n  () => this.helpers.httpRequest({\n    method: 'POST',\n    url: `${ENRICH_URL}/enrich`,\n    body: { email: lead.email, company: lead.company },\n    json: true,\n    timeout: 2000\n  }),\n  3,\n  200\n);\n\nif (!enrichRes.ok) {\n  return {\n    json: {\n      ...lead,\n      status: 'dead_lettered',\n      stage: 'enrichment',\n      reason: enrichRes.error,\n      attempts: enrichRes.attempts\n    }\n  };\n}\n\nconst enrichment = enrichRes.result;\n\nif (!isValidEnrichment(enrichment)) {\n  return {\n    json: {\n      ...lead,\n      enrichment,\n      status: 'dead_lettered',\n      stage: 'enrichment_response_invalid',\n      reason: 'enrichment response missing required fields (industry, company_size, fit_score)',\n      attempts: enrichRes.attempts\n    }\n  };\n}\n\nconst crmRes = await withRetry(\n  () => this.helpers.httpRequest({\n    method: 'POST',\n    url: `${CRM_URL}/contacts`,\n    body: {\n      email: lead.email,\n      name: lead.name,\n      company: lead.company,\n      phone: lead.phone,\n      message: lead.message,\n      lead_id: lead.lead_id,\n      idempotency_key: idempotencyKey,\n      enrichment\n    },\n    json: true,\n    timeout: 2000\n  }),\n  3,\n  200\n);\n\nif (!crmRes.ok) {\n  return await reconcile.call(this, 'crm_upsert', crmRes.error, crmRes.attempts);\n}\n\nif (!isWellFormedCrmContact(crmRes.result)) {\n  return await reconcile.call(this, 'crm_response_invalid',\n    'CRM response missing status=ok or contact.email', crmRes.attempts);\n}\n\nif (!isValidCrmContact(crmRes.result.contact)) {\n  return identityMismatch(crmRes.result.contact, crmRes.attempts);\n}\n\nreturn {\n  json: {\n    ...lead,\n    enrichment,\n    crm_contact: crmRes.result.contact,\n    status: 'accepted'\n  }\n};"
       },
       "id": "enrich-and-upsert",
       "name": "Enrich And Upsert (retry+backoff)",
@@ -159,7 +159,7 @@
         "url": "={{ $env.CRM_URL }}/dead-letter",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ lead_id: $json.lead_id, email: $json.email, name: $json.name, company: $json.company, stage: $json.stage, reason: $json.reason, attempts: $json.attempts, received_at: $json.received_at }) }}",
+        "jsonBody": "={{ JSON.stringify({ record_key: 'dead_letter:' + $execution.id, lead_id: $json.lead_id, email: $json.email, name: $json.name, company: $json.company, stage: $json.stage, reason: $json.reason, attempts: $json.attempts, received_at: $json.received_at }) }}",
         "options": {
           "timeout": 5000
         },
@@ -170,7 +170,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1100,
+        1320,
         320
       ],
       "retryOnFail": true,
@@ -191,7 +191,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        1320,
+        1540,
         320
       ]
     },
@@ -201,7 +201,7 @@
         "url": "={{ $env.ALERT_URL }}/alert",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ type: 'new_lead', lead_id: $json.lead_id, email: $json.email, company: $json.company, fit_score: $json.enrichment ? $json.enrichment.fit_score : null }) }}",
+        "jsonBody": "={{ JSON.stringify({ alert_key: 'alert:' + $execution.id, type: 'new_lead', lead_id: $json.lead_id, email: $json.email, company: $json.company, fit_score: $json.enrichment ? $json.enrichment.fit_score : null }) }}",
         "options": {
           "timeout": 5000
         },
@@ -266,7 +266,7 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.4,
       "position": [
-        1320,
+        1540,
         460
       ]
     },
@@ -285,6 +285,97 @@
       "position": [
         1320,
         20
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "unknown-cond",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "outcome_unknown",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-outcome-unknown",
+      "name": "Outcome Unknown?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CRM_URL }}/outcome-unknown",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ record_key: 'outcome_unknown:' + $execution.id, lead_id: $json.lead_id, email: $json.email, name: $json.name, company: $json.company, stage: $json.stage, reason: $json.reason, attempts: $json.attempts, received_at: $json.received_at }) }}",
+        "options": {
+          "timeout": 5000
+        },
+        "contentType": "json"
+      },
+      "id": "record-outcome-unknown",
+      "name": "Record Outcome Unknown",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        600
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 800,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'outcome_unknown', lead_id: $('Enrich And Upsert (retry+backoff)').item.json.lead_id, stage: $('Enrich And Upsert (retry+backoff)').item.json.stage, reason: $('Enrich And Upsert (retry+backoff)').item.json.reason }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "id": "respond-outcome-unknown",
+      "name": "Respond Outcome Unknown",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1540,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'outcome_unknown_not_recorded', lead_id: $('Enrich And Upsert (retry+backoff)').item.json.lead_id, stage: $('Enrich And Upsert (retry+backoff)').item.json.stage, reason: $('Enrich And Upsert (retry+backoff)').item.json.reason }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "id": "respond-outcome-unknown-not-recorded",
+      "name": "Respond Outcome Unknown Not Recorded",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1540,
+        740
       ]
     }
   ],
@@ -369,7 +460,7 @@
         ],
         [
           {
-            "node": "Record Dead Letter",
+            "node": "Outcome Unknown?",
             "type": "main",
             "index": 0
           }
@@ -406,6 +497,42 @@
         [
           {
             "node": "Respond Accepted Alert Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outcome Unknown?": {
+      "main": [
+        [
+          {
+            "node": "Record Outcome Unknown",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Dead Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Outcome Unknown": {
+      "main": [
+        [
+          {
+            "node": "Respond Outcome Unknown",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Outcome Unknown Not Recorded",
             "type": "main",
             "index": 0
           }

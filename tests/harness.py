@@ -20,8 +20,20 @@ It then reads the mock CRM's state and the alert sink's log and checks
 them against known ground truth recorded alongside each synthetic lead,
 including the reconciliation identity:
 
-    leads_in == sum(contact.upsert_count for contact in CRM contacts)
-                + len(rejected) + len(dead_letter)
+    leads_in == upserts + len(rejected) + len(dead_letter) + len(outcome_unknown)
+
+where upserts = sum(contact.upsert_count) over CRM contacts whose lead is
+NOT recorded as outcome_unknown (an unknown outcome may or may not have
+committed; it is counted once, as unknown, never also as an upsert).
+
+It also exercises the ambiguous-write, response-identity and
+record/alert-idempotency cases from the 2026-09-27 rereview: every CRM
+acknowledgement lost after commit (reconciles to upserted), malformed
+acknowledgement after a durable write with the reconciliation lookup down
+(outcome_unknown), a well-formed 200 for the wrong contact
+(crm_response_identity_mismatch), and a lost acknowledgement on each of
+Record Rejected / Record Dead Letter / Send Alert (retry must not
+duplicate the row/alert).
 
 Everything is torn down at the end (container removed, mock processes
 killed, temp dirs removed) whether the run passes or fails.
@@ -296,6 +308,7 @@ def main() -> int:
         leads_in = 0
         expected_rejected = 0
         expected_dead_letter = 0
+        expected_unknown = 0
         expected_accepted_events = 0  # each accepted send is one upsert event
         expected_alert_fired = 0  # accepted sends where the alert sink itself succeeded
 
@@ -421,6 +434,77 @@ def main() -> int:
               f"alert-outage lead: CRM accepted but response is non-200/failed, not silent success (status={status}, body={body})")
         toggle_outage(env.alert_port, False)
 
+        crm = f"http://127.0.0.1:{env.crm_port}"
+
+        # --- 12. ALL CRM acknowledgements lost after the write commits:
+        #        retries exhaust, the workflow reconciles by idempotency key,
+        #        finds the committed write -> upserted, not dead-lettered. ---
+        status, _ = http_json("POST", f"{crm}/admin/drop-reply-once", {"on": True, "count": 3})
+        check(status == 200, "armed CRM drop-reply x3 (every ack lost)")
+        status, body = send_lead(env, {"lead_id": "AK1", "name": "All Acks Lost", "email": "ak1@example.com", "company": "Retry Co"})
+        leads_in += 1
+        expected_accepted_events += 1
+        expected_alert_fired += 1
+        check(status == 200 and body.get("status") == "accepted",
+              f"all-acks-lost lead reconciles to upserted/accepted, not dead_lettered (status={status}, body={body})")
+
+        # --- 13. malformed ack AFTER a durable write, reconciliation lookup
+        #        down -> outcome_unknown (own record), never dead_lettered. ---
+        http_json("POST", f"{crm}/admin/malformed-after-commit-once", {"on": True})
+        http_json("POST", f"{crm}/admin/lookup-outage", {"on": True})
+        status, body = send_lead(env, {"lead_id": "UK1", "name": "Unknown Outcome", "email": "uk1@example.com", "company": "Ambiguous Co"})
+        http_json("POST", f"{crm}/admin/lookup-outage", {"on": False})
+        leads_in += 1
+        expected_unknown += 1
+        check(status == 502 and body.get("status") == "outcome_unknown" and body.get("stage") == "crm_response_invalid",
+              f"malformed-ack-after-commit + lookup down -> outcome_unknown (status={status}, body={body})")
+
+        # --- 14. malformed ack after a durable write, lookup up -> the
+        #        committed write is found, reconciled to upserted. ---
+        http_json("POST", f"{crm}/admin/malformed-after-commit-once", {"on": True})
+        status, body = send_lead(env, {"lead_id": "MA1", "name": "Malformed After Commit", "email": "ma1@example.com", "company": "Ambiguous Co"})
+        leads_in += 1
+        expected_accepted_events += 1
+        expected_alert_fired += 1
+        check(status == 200 and body.get("status") == "accepted",
+              f"malformed-ack-after-commit + lookup up -> reconciled to accepted (status={status}, body={body})")
+
+        # --- 15. response identity: well-formed 200 for a DIFFERENT contact
+        #        (exact rereview reproduction) -> dead-lettered as
+        #        crm_response_identity_mismatch, no accepted notification. ---
+        http_json("POST", f"{crm}/admin/wrong-identity-once", {"on": True})
+        status, body = send_lead(env, {"lead_id": "A1", "name": "Synthetic", "email": "a@example.com", "company": "Example"})
+        leads_in += 1
+        expected_dead_letter += 1
+        check(status == 502 and body.get("status") == "dead_lettered" and body.get("stage") == "crm_response_identity_mismatch",
+              f"wrong-contact 200 dead-lettered as crm_response_identity_mismatch, not accepted (status={status}, body={body})")
+
+        # --- 16-18. lost ack on each retried side effect: the node's retry
+        #        must be deduped by its record/alert key -> exactly one row. ---
+        http_json("POST", f"{crm}/admin/drop-record-reply-once", {"path": "/rejected"})
+        status, body = send_lead(env, {"lead_id": "RR1", "name": "Rejected Ack Lost", "company": "Acme"})
+        leads_in += 1
+        expected_rejected += 1
+        check(status == 422 and body.get("status") == "rejected",
+              f"rejected-record ack lost: retry succeeds as normal rejection (status={status}, body={body})")
+
+        http_json("POST", f"{crm}/admin/drop-record-reply-once", {"path": "/dead-letter"})
+        toggle_outage(env.enrich_port, True)
+        status, body = send_lead(env, {"lead_id": "RD1", "name": "Dead Letter Ack Lost", "email": "rd1@example.com", "company": "Acme"})
+        toggle_outage(env.enrich_port, False)
+        leads_in += 1
+        expected_dead_letter += 1
+        check(status == 502 and body.get("status") == "dead_lettered",
+              f"dead-letter-record ack lost: retry succeeds as normal dead_lettered (status={status}, body={body})")
+
+        http_json("POST", f"http://127.0.0.1:{env.alert_port}/admin/drop-reply-once", {"on": True})
+        status, body = send_lead(env, {"lead_id": "RA1", "name": "Alert Ack Lost", "email": "ra1@example.com", "company": "Notify Co"})
+        leads_in += 1
+        expected_accepted_events += 1
+        expected_alert_fired += 1
+        check(status == 200 and body.get("status") == "accepted",
+              f"alert ack lost: retry succeeds as normal accepted (status={status}, body={body})")
+
         # --- 11. recording-store outage: MUST-FIX 1. If /rejected or
         #        /dead-letter itself cannot be written, the response must
         #        say so truthfully -- never the normal rejected/dead_lettered
@@ -460,21 +544,42 @@ def main() -> int:
         contacts = state.get("contacts", {})
         rejected = state.get("rejected", [])
         dead_letter = state.get("dead_letter", [])
+        unknown = state.get("outcome_unknown", [])
+        unknown_ids = {u.get("lead_id") for u in unknown}
 
-        actual_upsert_events = sum(c.get("upsert_count", 0) for c in contacts.values())
+        actual_upsert_events = sum(c.get("upsert_count", 0) for c in contacts.values() if c.get("lead_id") not in unknown_ids)
         check(actual_upsert_events == expected_accepted_events,
               f"CRM upsert events == accepted leads ({actual_upsert_events} == {expected_accepted_events})")
         check(len(rejected) == expected_rejected, f"rejected records == expected ({len(rejected)} == {expected_rejected})")
         check(len(dead_letter) == expected_dead_letter, f"dead-letter records == expected ({len(dead_letter)} == {expected_dead_letter})")
 
-        total_out = actual_upsert_events + len(rejected) + len(dead_letter)
-        check(total_out == leads_in, f"reconciliation: leads_in ({leads_in}) == upserts+rejected+dead_lettered ({total_out})")
+        check(len(unknown) == expected_unknown, f"outcome_unknown records == expected ({len(unknown)} == {expected_unknown})")
+
+        total_out = actual_upsert_events + len(rejected) + len(dead_letter) + len(unknown)
+        check(total_out == leads_in, f"reconciliation: leads_in ({leads_in}) == upserts+rejected+dead_lettered+unknown ({total_out})")
+
+        # ambiguous writes: each lead has exactly ONE terminal outcome
+        check(unknown_ids == {"UK1"}, f"outcome_unknown rows are exactly UK1 (got {unknown_ids})")
+        check(contacts.get("uk1@example.com") is not None,
+              "UK1's write really did commit (the case is genuinely ambiguous, not a plain failure)")
+        dl_ids = [d.get("lead_id") for d in dead_letter]
+        for lid in ("AK1", "MA1", "UK1"):
+            check(lid not in dl_ids, f"{lid} not also dead-lettered (no double terminal outcome)")
+        for email in ("ak1@example.com", "ma1@example.com"):
+            c = contacts.get(email)
+            check(c is not None and c.get("upsert_count") == 1, f"{email} committed exactly once (upsert_count == 1)")
+        check("a@example.com" not in contacts and "other@example.com" not in contacts,
+              "identity-mismatch case wrote no contact")
+
+        # record/alert idempotency: exactly one row per logical event
+        check(sum(1 for r in rejected if r.get("lead_id") == "RR1") == 1, "RR1: exactly one rejected row after ack-lost retry")
+        check(dl_ids.count("RD1") == 1, "RD1: exactly one dead-letter row after ack-lost retry")
 
         # duplicate-email lead must collapse into ONE contact with upsert_count==2
         ada = contacts.get("ada@example.com")
         check(ada is not None, "ada@example.com present in CRM contacts")
         check(ada is not None and ada.get("upsert_count") == 2, f"ada@example.com upsert_count == 2 (duplicate collapsed, not duplicated) (got {ada.get('upsert_count') if ada else None})")
-        check(len(contacts) == 6, f"exactly 6 distinct CRM contacts (3 valid + post-outage + idempotent-retry + alert-failure, dup collapsed) (got {len(contacts)})")
+        check(len(contacts) == 10, f"exactly 10 distinct CRM contacts (3 valid + post-outage + idempotent-retry + alert-failure + AK1 + UK1 + MA1 + RA1, dup collapsed) (got {len(contacts)})")
 
         # idempotent-retry lead: the lost-ack retry must NOT have double-committed
         idem = contacts.get("idem@example.com")
@@ -496,7 +601,8 @@ def main() -> int:
         check(dl_by_id.get("D2", {}).get("stage") == "crm_upsert", "D2 dead-lettered at crm_upsert stage")
         check(dl_by_id.get("D1", {}).get("attempts") == 3, f"D1 exhausted 3 retry attempts (got {dl_by_id.get('D1', {}).get('attempts')})")
         check(dl_by_id.get("ME1", {}).get("stage") == "enrichment_response_invalid", "ME1 dead-lettered at enrichment_response_invalid stage")
-        check(dl_by_id.get("MC1", {}).get("stage") == "crm_response_invalid", "MC1 dead-lettered at crm_response_invalid stage")
+        check(dl_by_id.get("MC1", {}).get("stage") == "crm_response_invalid", "MC1 dead-lettered at crm_response_invalid stage (reconciliation confirmed nothing written)")
+        check(dl_by_id.get("A1", {}).get("stage") == "crm_response_identity_mismatch", "A1 dead-letter row carries stage crm_response_identity_mismatch")
 
         # alerts: fired only where CRM accepted AND the alert sink itself
         # succeeded -- never for rejected/dead-lettered, and never claimed
@@ -504,8 +610,10 @@ def main() -> int:
         fired = alerts(env)
         alert_lead_ids = {a.get("lead_id") for a in fired}
         check(len(fired) == expected_alert_fired, f"alert fired exactly where notification succeeded ({len(fired)} == {expected_alert_fired})")
-        check(alert_lead_ids == {"L1", "L2", "L3", "L1-DUP", "L4", "ID1"}, f"alerts fired for exactly the notification-succeeded lead_ids (got {alert_lead_ids})")
+        check(alert_lead_ids == {"L1", "L2", "L3", "L1-DUP", "L4", "ID1", "AK1", "MA1", "RA1"}, f"alerts fired for exactly the notification-succeeded lead_ids (got {alert_lead_ids})")
         check("AL1" not in alert_lead_ids, "AL1 (alert-outage lead) never recorded a successful alert")
+        check("A1" not in alert_lead_ids and "UK1" not in alert_lead_ids, "no accepted notification for identity-mismatch (A1) or unknown (UK1)")
+        check(sum(1 for a in fired if a.get("lead_id") == "RA1") == 1, "RA1: exactly one alert after ack-lost retry")
 
     finally:
         teardown(env)

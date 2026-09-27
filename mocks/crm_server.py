@@ -60,6 +60,31 @@ prevent). Modelling all three as one mock process is a synthetic-demo
 simplification; the two failure domains are still kept logically and
 operationally separate.
 
+POST /admin/drop-reply-once also accepts {"count": N}: the next N
+/contacts replies are dropped after commit (including replays served
+from the idempotency cache), modelling "every acknowledgement lost".
+POST /admin/malformed-after-commit-once commits the next /contacts
+write durably, then answers 200 {} -- the ambiguous case where the
+workflow cannot tell from the reply whether anything was written.
+POST /admin/wrong-identity-once answers the next /contacts write with a
+well-formed 200 for a DIFFERENT contact (lead_id OTHER) without writing.
+
+Reconciliation: GET /contacts/lookup?idempotency_key=K answers
+{"found": true, "contact": {...}} if a write under K committed, else
+{"found": false}. The workflow calls it before classifying any ambiguous
+CRM outcome (retries exhausted, malformed 200). It is a read path and is
+NOT affected by the /contacts outage toggle; POST /admin/lookup-outage
+makes it return 503 so the "reconciliation itself failed" branch
+(outcome_unknown) can be tested.
+
+Record idempotency: POST /rejected, /dead-letter and /outcome-unknown
+accept a "record_key" (the workflow mints one per logical event from its
+execution id). A repeat under an existing record_key returns the
+original ack without appending a second row, so the n8n node's automatic
+retry after a lost acknowledgement cannot duplicate a row.
+POST /admin/drop-record-reply-once {"path": "/rejected"} commits the next
+write to that path and drops its reply.
+
 A SEPARATE toggle, POST /admin/recording-outage, exists only to test
 what happens when the recording path ITSELF is unavailable (a real
 exception-queue outage, not modelled by the /contacts toggle above): it
@@ -78,13 +103,19 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 LOCK = threading.Lock()
 STATE_PATH: str = ""
 OUTAGE = {"on": False}
-DROP_REPLY_ONCE = {"armed": False}
 MALFORMED_ONCE = {"armed": False}
 RECORDING_OUTAGE = {"on": False}
+DROP_REPLY_COUNT = {"n": 0}
+MALFORMED_AFTER_COMMIT_ONCE = {"armed": False}
+WRONG_IDENTITY_ONCE = {"armed": False}
+LOOKUP_OUTAGE = {"on": False}
+DROP_RECORD_REPLY_ONCE: dict = {}  # path -> True
+RECORD_COLLECTIONS = {"/rejected": "rejected", "/dead-letter": "dead_letter", "/outcome-unknown": "outcome_unknown"}
 
 
 def _fingerprint(body: dict) -> str:
@@ -101,7 +132,7 @@ def _now() -> str:
 
 
 def _empty_state() -> dict:
-    return {"contacts": {}, "rejected": [], "dead_letter": [], "idempotency": {}}
+    return {"contacts": {}, "rejected": [], "dead_letter": [], "outcome_unknown": [], "idempotency": {}}
 
 
 def _load() -> dict:
@@ -110,6 +141,7 @@ def _load() -> dict:
     with open(STATE_PATH, "r", encoding="utf-8") as f:
         state = json.load(f)
     state.setdefault("idempotency", {})
+    state.setdefault("outcome_unknown", [])
     return state
 
 
@@ -156,7 +188,20 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self):
-        if self.path == "/contacts":
+        if self.path.startswith("/contacts/lookup"):
+            if LOOKUP_OUTAGE["on"]:
+                self._send_json(503, {"error": "lookup_outage"})
+                return
+            qs = parse_qs(urlparse(self.path).query)
+            key = (qs.get("idempotency_key") or [""])[0]
+            with LOCK:
+                state = _load()
+            prior = state["idempotency"].get(key) if key else None
+            if prior is None:
+                self._send_json(200, {"found": False})
+            else:
+                self._send_json(200, {"found": True, "contact": prior["response"]["contact"]})
+        elif self.path == "/contacts":
             with LOCK:
                 state = _load()
             self._send_json(200, {"contacts": list(state["contacts"].values())})
@@ -168,6 +213,10 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 state = _load()
             self._send_json(200, {"dead_letter": state["dead_letter"]})
+        elif self.path == "/outcome-unknown":
+            with LOCK:
+                state = _load()
+            self._send_json(200, {"outcome_unknown": state["outcome_unknown"]})
         elif self.path == "/admin/state":
             with LOCK:
                 state = _load()
@@ -189,15 +238,39 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 _atomic_write(_empty_state())
             OUTAGE["on"] = False
-            DROP_REPLY_ONCE["armed"] = False
+            DROP_REPLY_COUNT["n"] = 0
             MALFORMED_ONCE["armed"] = False
             RECORDING_OUTAGE["on"] = False
+            MALFORMED_AFTER_COMMIT_ONCE["armed"] = False
+            WRONG_IDENTITY_ONCE["armed"] = False
+            LOOKUP_OUTAGE["on"] = False
+            DROP_RECORD_REPLY_ONCE.clear()
             self._send_json(200, {"reset": True})
             return
         if self.path == "/admin/drop-reply-once":
             body = self._read_json()
-            DROP_REPLY_ONCE["armed"] = bool(body.get("on", True))
-            self._send_json(200, {"armed": DROP_REPLY_ONCE["armed"]})
+            DROP_REPLY_COUNT["n"] = int(body.get("count", 1)) if body.get("on", True) else 0
+            self._send_json(200, {"armed": DROP_REPLY_COUNT["n"]})
+            return
+        if self.path == "/admin/malformed-after-commit-once":
+            body = self._read_json()
+            MALFORMED_AFTER_COMMIT_ONCE["armed"] = bool(body.get("on", True))
+            self._send_json(200, {"armed": MALFORMED_AFTER_COMMIT_ONCE["armed"]})
+            return
+        if self.path == "/admin/wrong-identity-once":
+            body = self._read_json()
+            WRONG_IDENTITY_ONCE["armed"] = bool(body.get("on", True))
+            self._send_json(200, {"armed": WRONG_IDENTITY_ONCE["armed"]})
+            return
+        if self.path == "/admin/lookup-outage":
+            body = self._read_json()
+            LOOKUP_OUTAGE["on"] = bool(body.get("on", False))
+            self._send_json(200, {"on": LOOKUP_OUTAGE["on"]})
+            return
+        if self.path == "/admin/drop-record-reply-once":
+            body = self._read_json()
+            DROP_RECORD_REPLY_ONCE[str(body.get("path", ""))] = True
+            self._send_json(200, {"armed": sorted(DROP_RECORD_REPLY_ONCE)})
             return
         if self.path == "/admin/malformed-once":
             body = self._read_json()
@@ -217,6 +290,11 @@ class Handler(BaseHTTPRequestHandler):
                 MALFORMED_ONCE["armed"] = False
                 self._send_json(200, {})
                 return
+            if WRONG_IDENTITY_ONCE["armed"]:
+                WRONG_IDENTITY_ONCE["armed"] = False
+                self._read_json()
+                self._send_json(200, {"status": "ok", "contact": {"email": "other@example.com", "lead_id": "OTHER"}})
+                return
             body = self._read_json()
             email = str(body.get("email", "")).strip().lower()
             if not email:
@@ -235,6 +313,10 @@ class Handler(BaseHTTPRequestHandler):
                             # Same logical write retried (request resent, or
                             # the original reply was lost) -- return the
                             # original result, do not write or count again.
+                            if DROP_REPLY_COUNT["n"] > 0:
+                                DROP_REPLY_COUNT["n"] -= 1
+                                self.close_connection = True
+                                return
                             self._send_json(200, prior["response"])
                             return
                         # Same key, different payload: a genuine conflict,
@@ -267,9 +349,11 @@ class Handler(BaseHTTPRequestHandler):
 
                 _atomic_write(state)
 
-                if DROP_REPLY_ONCE["armed"]:
-                    DROP_REPLY_ONCE["armed"] = False
+                if DROP_REPLY_COUNT["n"] > 0:
+                    DROP_REPLY_COUNT["n"] -= 1
                     drop_this_reply = True
+                malformed_reply = MALFORMED_AFTER_COMMIT_ONCE["armed"]
+                MALFORMED_AFTER_COMMIT_ONCE["armed"] = False
 
             if drop_this_reply:
                 # The write above is already committed and (if an
@@ -278,32 +362,35 @@ class Handler(BaseHTTPRequestHandler):
                 # same key will hit the cache branch above, not write again.
                 self.close_connection = True
                 return
+            if malformed_reply:
+                self._send_json(200, {})  # write committed; reply garbled
+                return
 
             self._send_json(200, response)
-        elif self.path == "/rejected":
+        elif self.path in RECORD_COLLECTIONS:
             if RECORDING_OUTAGE["on"]:
-                self._send_json(503, {"error": "recording_outage", "detail": "mock rejection store is simulating an outage"})
+                self._send_json(503, {"error": "recording_outage", "detail": "mock recording store is simulating an outage"})
                 return
+            collection = RECORD_COLLECTIONS[self.path]
             body = self._read_json()
+            record_key = body.get("record_key")
             with LOCK:
                 state = _load()
-                entry = dict(body)
-                entry["recorded_at"] = _now()
-                state["rejected"].append(entry)
-                _atomic_write(state)
-            self._send_json(200, {"status": "ok"})
-        elif self.path == "/dead-letter":
-            if RECORDING_OUTAGE["on"]:
-                self._send_json(503, {"error": "recording_outage", "detail": "mock dead-letter store is simulating an outage"})
+                rows = state[collection]
+                if record_key and any(r.get("record_key") == record_key for r in rows):
+                    # Retry of an already-recorded event (e.g. the first
+                    # ack was lost): same ack, no second row.
+                    ack = {"status": "ok", "duplicate": True}
+                else:
+                    entry = dict(body)
+                    entry["recorded_at"] = _now()
+                    rows.append(entry)
+                    _atomic_write(state)
+                    ack = {"status": "ok"}
+            if DROP_RECORD_REPLY_ONCE.pop(self.path, False):
+                self.close_connection = True  # committed; ack lost
                 return
-            body = self._read_json()
-            with LOCK:
-                state = _load()
-                entry = dict(body)
-                entry["recorded_at"] = _now()
-                state["dead_letter"].append(entry)
-                _atomic_write(state)
-            self._send_json(200, {"status": "ok"})
+            self._send_json(200, ack)
         else:
             self._send_json(404, {"error": "not_found"})
 

@@ -7,6 +7,13 @@ server, 127.0.0.1 only. Appends each alert to a JSON array file, written
 atomically (temp file + os.replace) on every write, same pattern as the
 CRM mock, so the file is never observed half-written.
 
+Idempotency: an alert may carry an "alert_key" (minted by the workflow
+once per logical notification, from its execution id). A repeat under an
+existing alert_key returns the original ack without appending a second
+alert, so the Send Alert node's automatic retry after a lost
+acknowledgement cannot notify twice. POST /admin/drop-reply-once commits
+the next alert and drops its reply, to test exactly that.
+
 Supports an outage toggle (POST /admin/outage) so the test harness can
 simulate the alert sink being down (a 503, not recorded) -- exercised by
 the workflow's Send Alert retry and its distinct
@@ -26,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOCK = threading.Lock()
 STATE_PATH: str = ""
 OUTAGE = {"on": False}
+DROP_REPLY_ONCE = {"armed": False}
 
 
 def _now() -> str:
@@ -93,6 +101,11 @@ class Handler(BaseHTTPRequestHandler):
             OUTAGE["on"] = bool(body.get("on", False))
             self._send_json(200, {"on": OUTAGE["on"]})
             return
+        if self.path == "/admin/drop-reply-once":
+            body = self._read_json()
+            DROP_REPLY_ONCE["armed"] = bool(body.get("on", True))
+            self._send_json(200, {"armed": DROP_REPLY_ONCE["armed"]})
+            return
         if self.path != "/alert":
             self._send_json(404, {"error": "not_found"})
             return
@@ -100,13 +113,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": "alert_outage", "detail": "mock alert sink is simulating an outage"})
             return
         body = self._read_json()
+        alert_key = body.get("alert_key")
         with LOCK:
             alerts = _load()
-            entry = dict(body)
-            entry["received_at"] = _now()
-            alerts.append(entry)
-            _atomic_write(alerts)
-        self._send_json(200, {"status": "ok"})
+            if alert_key and any(a.get("alert_key") == alert_key for a in alerts):
+                ack = {"status": "ok", "duplicate": True}
+            else:
+                entry = dict(body)
+                entry["received_at"] = _now()
+                alerts.append(entry)
+                _atomic_write(alerts)
+                ack = {"status": "ok"}
+        if DROP_REPLY_ONCE["armed"]:
+            DROP_REPLY_ONCE["armed"] = False
+            self.close_connection = True  # committed; ack lost
+            return
+        self._send_json(200, ack)
 
 
 def main() -> None:
