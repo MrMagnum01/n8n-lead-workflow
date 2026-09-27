@@ -82,21 +82,31 @@ Nodes, in order:
    (`industry`/`company_size`/`fit_score`; `status: "ok"` plus a
    contact), and the CRM contact's **identity is bound to the request**:
    its `lead_id` and `email` must equal the submitted lead's. A
-   well-formed `200` for a different contact is dead-lettered with stage
-   `crm_response_identity_mismatch` and never reaches the accepted
-   notification. An empty or malformed `200` is not accepted and not
-   blindly retried.
+   well-formed `200` for a different contact never reaches the accepted
+   notification, but is never assumed to mean nothing was written either
+   -- wrong identity alone cannot prove non-commit (a8b653d rereview,
+   2026-09-27 outcome-recheck finding 1). It is reconciled the same way
+   as any other ambiguous CRM outcome, stage `crm_response_identity_mismatch`
+   (see below): confirmed absent under this lead's own idempotency key ->
+   `dead_lettered`; found with this lead's own identity -> `accepted`;
+   found but still identity-mismatched, or the reconciliation lookup
+   itself fails -> `outcome_unknown`. An empty or malformed `200` is not
+   accepted and not blindly retried.
 
    **Ambiguous CRM outcomes are reconciled, not guessed.** When CRM
-   transport retries are exhausted, or a malformed `200` arrives, the
-   write may or may not have committed. Before classifying, the node
-   looks the idempotency key up in the CRM (`GET /contacts/lookup`):
-   found -> the write committed, the lead is `accepted` (upserted);
-   confirmed absent -> `dead_lettered` (`crm_upsert` /
-   `crm_response_invalid`); lookup itself failed -> **`outcome_unknown`**,
-   recorded in its own collection (not the dead-letter log) and answered
-   with `status: "outcome_unknown"`. Enrichment transport failure (no
-   write attempted) is dead-lettered directly. Nothing is just swallowed.
+   transport retries are exhausted, a malformed `200` arrives, or a
+   well-formed `200` names the wrong contact, the write may or may not
+   have committed under this lead's own identity. Before classifying,
+   the node looks the idempotency key up in the CRM
+   (`GET /contacts/lookup`): found with this lead's own identity -> the
+   write committed, the lead is `accepted` (upserted); confirmed absent
+   -> `dead_lettered` (`crm_upsert` / `crm_response_invalid` /
+   `crm_response_identity_mismatch`); found but the lookup's own
+   identity is also wrong, or the lookup itself failed ->
+   **`outcome_unknown`**, recorded in its own collection (not the
+   dead-letter log) and answered with `status: "outcome_unknown"`.
+   Enrichment transport failure (no write attempted) is dead-lettered
+   directly. Nothing is just swallowed.
 5. **Accepted?** / **Outcome Unknown?** -- routes `outcome_unknown` to
    **Record Outcome Unknown** (`POST /outcome-unknown`; a failed write
    answers `outcome_unknown_not_recorded`) and a persistent failure to
@@ -121,16 +131,41 @@ Nodes, in order:
    row or sending a second alert.
 
    **Reconciliation invariant.** Every intake ends in exactly one
-   business outcome:
+   business outcome, counted per lead EVENT (one send, one outcome):
 
    ```
-   leads_in == upserts + rejected + dead_lettered + unknown
+   leads_in == accepted + rejected + dead_lettered + unknown
    ```
 
-   where `unknown` counts `outcome_unknown` records and `upserts` counts
-   CRM upsert events for leads *not* recorded as unknown. An unknown lead
-   may in fact have committed; it is counted once, as unknown, pending
-   manual reconciliation -- never also as an upsert or a failure.
+   `rejected`, `dead_lettered` and `unknown` are each an exact per-event
+   count straight from their own record collections. An unknown lead may
+   in fact have committed a CRM write; it is counted once, as unknown,
+   pending manual reconciliation -- never also as an accepted upsert or
+   a dead-lettered failure (a well-formed CRM response for the wrong
+   contact is reconciled the same way: confirmed absent under this
+   lead's own idempotency key -> dead_lettered; confirmed present with
+   this lead's own identity -> accepted; present but still
+   identity-mismatched, or the reconciliation lookup itself fails ->
+   unknown -- wrong identity alone is never treated as proof nothing was
+   written).
+
+   **Accounting boundary.** The mock CRM's `contacts` collection is
+   aggregated by *email* (one row, one running `upsert_count`), not a
+   per-event ledger keyed by lead/idempotency identity. When the same
+   email is updated by two lead events with different outcomes (one
+   unknown-but-committed, one accepted), the aggregate's `upsert_count`
+   correctly reflects both writes, but final CRM state alone cannot say
+   which commit belongs to which outcome -- there is nothing to filter
+   the aggregate by that isn't itself the bug this note exists to avoid
+   (filtering by a contact's last-writer `lead_id` over- or
+   under-counts, exactly the failure the 2026-09-27 outcome-recheck
+   found). The test harness therefore does NOT claim to re-derive the
+   accepted/unknown split from CRM state after the fact: `accepted` and
+   `unknown` above are each counted once per event at send time,
+   independently checked against that event's own HTTP response, and
+   the CRM aggregate is used only for a combined cross-check --
+   `sum(contact.upsert_count) == accepted_events + unknown_but_committed_events`
+   -- never a per-status one.
 
 ### Why an "outage" doesn't also break the dead-letter/rejection log
 
@@ -167,7 +202,7 @@ confused with each other.
 | Service | File | Purpose |
 |---|---|---|
 | Enrichment | `mocks/enrichment_server.py` | Given `{email, company}`, returns a deterministic synthetic firmographic record (industry, size band, fit score) derived from a hash of the input. `POST /admin/outage {"on": true\|false}` simulates the vendor being down (`503`). `POST /admin/malformed-once` arms a one-shot `200 {}` malformed-success response, testing that the workflow validates the fields it depends on rather than trusting any `200`. |
-| CRM | `mocks/crm_server.py` | Holds `contacts` (upserted by lowercased email -- a repeat email updates the existing record, tracked via `upsert_count`, rather than creating a duplicate), `rejected`, `dead_letter`, `outcome_unknown`, and an `idempotency` cache keyed by the request's `idempotency_key`, all in one atomically-written JSON state file. `GET /admin/state` returns all of them for reconciliation; `GET /contacts/lookup?idempotency_key=` answers whether a keyed write committed (not affected by the `/contacts` outage; `POST /admin/lookup-outage` takes it down). Record writes dedupe on `record_key`. `POST /admin/outage` affects only `/contacts` (see above); `POST /admin/recording-outage` affects only `/rejected` and `/dead-letter`, for testing recording-path failure specifically. `POST /admin/drop-reply-once` (optional `count`) commits a `/contacts` write normally but drops the next reply(s), modelling lost acknowledgements. `POST /admin/malformed-once` returns `200 {}` from `/contacts` without writing; `/admin/malformed-after-commit-once` writes, then returns `200 {}`; `/admin/wrong-identity-once` returns a well-formed `200` for a different contact; `/admin/drop-record-reply-once` drops the ack of the next `/rejected` or `/dead-letter` write. |
+| CRM | `mocks/crm_server.py` | Holds `contacts` (upserted by lowercased email -- a repeat email updates the existing record, tracked via `upsert_count`, rather than creating a duplicate), `rejected`, `dead_letter`, `outcome_unknown`, and an `idempotency` cache keyed by the request's `idempotency_key`, all in one atomically-written JSON state file. `GET /admin/state` returns all of them for reconciliation; `GET /contacts/lookup?idempotency_key=` answers whether a keyed write committed (not affected by the `/contacts` outage; `POST /admin/lookup-outage` takes it down). Record writes dedupe on `record_key`. `POST /admin/outage` affects only `/contacts` (see above); `POST /admin/recording-outage` affects only `/rejected` and `/dead-letter`, for testing recording-path failure specifically. `POST /admin/drop-reply-once` (optional `count`) commits a `/contacts` write normally but drops the next reply(s), modelling lost acknowledgements. `POST /admin/malformed-once` returns `200 {}` from `/contacts` without writing; `/admin/malformed-after-commit-once` writes, then returns `200 {}`; `/admin/wrong-identity-once` returns a well-formed `200` for a different contact without writing; `/admin/wrong-identity-after-commit-once` writes for real under the caller's own idempotency key, then returns a well-formed `200` for a different contact; `/admin/lookup-wrong-identity-once` answers the next successful `/contacts/lookup` with a different contact's identity instead of the true cached one; `/admin/drop-record-reply-once` drops the ack of the next `/rejected` or `/dead-letter` write. |
 | Alert sink | `mocks/alert_server.py` | Appends each alert to a JSON array file, same atomic-write pattern. A repeat `alert_key` returns the original ack without a second alert; `POST /admin/drop-reply-once` commits the next alert and drops its ack. `GET /alerts` reads it back. `POST /admin/outage {"on": true\|false}` simulates the sink being down (`503`), exercising Send Alert's retry and its distinct `accepted_notification_failed` response. |
 
 ## Running the test harness
@@ -205,24 +240,31 @@ This is a single self-contained script (standard library only -- no
    CRM acknowledgement lost (reconciles to upserted), a malformed
    acknowledgement after a durable write with the lookup down
    (`outcome_unknown`) and with it up (reconciles to upserted), a
-   well-formed `200` for the wrong contact
-   (`crm_response_identity_mismatch`), and a lost acknowledgement on each
-   of Record Rejected / Record Dead Letter / Send Alert (exactly one
-   row/alert after the retry);
+   well-formed `200` for the wrong contact with no real write behind it
+   (`crm_response_identity_mismatch`, dead-lettered), a well-formed `200`
+   for the wrong contact where the write DID commit -- reconciled to
+   accepted when the lookup confirms this lead's own identity, or
+   `outcome_unknown` when the lookup's identity is also wrong -- the same
+   email updated twice with one event unknown and one accepted in both
+   orders (accounting must hold regardless of write order), and a lost
+   acknowledgement on each of Record Rejected / Record Dead Letter / Send
+   Alert (exactly one row/alert after the retry);
 5. reads the mock CRM's `/admin/state` and the alert sink's `/alerts`,
    and asserts the result against known ground truth, including the
    reconciliation identity:
 
    ```
-   leads_in == sum(contact.upsert_count for CRM contacts not in outcome_unknown)
-               + len(rejected)
-               + len(dead_letter)
-               + len(outcome_unknown)
+   leads_in == accepted_events + len(rejected) + len(dead_letter) + len(outcome_unknown)
    ```
 
-   (upsert *events*, not distinct contacts -- the duplicate lead must
+   counted once per lead EVENT, not by filtering the CRM's `contacts`
+   collection (which aggregates by email, not by event -- see
+   "Accounting boundary" above for why that filter was wrong for a
+   same-email unknown+accepted pair, and why the harness cross-checks
+   the CRM aggregate only as a combined total instead). `accepted_events`
+   are upsert *events*, not distinct contacts -- the duplicate lead must
    increment an existing contact's `upsert_count`, not disappear from the
-   count.)
+   count.
 6. tears everything down in a `finally` block -- container removed, mock
    processes killed, temp dirs deleted -- whether the run passed or
    failed.

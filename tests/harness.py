@@ -17,23 +17,38 @@ mock outage on each of the enrichment and CRM services (exercising the
 retry+backoff path and the dead-letter branch).
 
 It then reads the mock CRM's state and the alert sink's log and checks
-them against known ground truth recorded alongside each synthetic lead,
-including the reconciliation identity:
+them against known ground truth recorded PER LEAD EVENT alongside each
+synthetic lead, including the reconciliation identity:
 
-    leads_in == upserts + len(rejected) + len(dead_letter) + len(outcome_unknown)
+    leads_in == accepted_events + len(rejected) + len(dead_letter) + len(outcome_unknown)
 
-where upserts = sum(contact.upsert_count) over CRM contacts whose lead is
-NOT recorded as outcome_unknown (an unknown outcome may or may not have
-committed; it is counted once, as unknown, never also as an upsert).
+where accepted_events/rejected/dead_letter/outcome_unknown are each
+counted once per lead EVENT (send), not derived by filtering the CRM's
+`contacts` collection -- that collection is aggregated by EMAIL (one row,
+one running upsert_count), not a per-event ledger, so it cannot be split
+back into "which commits were accepted vs unknown" once the same email
+has carried both outcomes. That combined total is instead cross-checked
+on its own: sum(contact.upsert_count) across all CRM contacts ==
+accepted_events + unknown_but_committed_events (an unknown outcome may
+or may not have committed; when it did, it is still counted once, as
+unknown, never also as a second upsert event) -- see the 2026-09-27
+outcome-recheck finding 2 note in the reconciliation block below for why
+this is a combined check, not a per-status one, on the CRM's own state.
 
 It also exercises the ambiguous-write, response-identity and
-record/alert-idempotency cases from the 2026-09-27 rereview: every CRM
-acknowledgement lost after commit (reconciles to upserted), malformed
-acknowledgement after a durable write with the reconciliation lookup down
-(outcome_unknown), a well-formed 200 for the wrong contact
-(crm_response_identity_mismatch), and a lost acknowledgement on each of
-Record Rejected / Record Dead Letter / Send Alert (retry must not
-duplicate the row/alert).
+record/alert-idempotency cases from the 2026-09-27 rereview and the
+2026-09-27 outcome-recheck: every CRM acknowledgement lost after commit
+(reconciles to upserted), malformed acknowledgement after a durable
+write with the reconciliation lookup down (outcome_unknown), a
+well-formed 200 for the wrong contact with no real write behind it
+(dead_lettered, confirmed absent by reconciliation), a well-formed 200
+for the wrong contact where the write DID commit under this lead's own
+idempotency key (accepted once reconciliation confirms the real
+identity, or outcome_unknown if the reconciliation lookup's identity is
+also wrong -- never dead_lettered on top of a real write), the same
+email updated twice with one event unknown and one accepted in both
+orders, and a lost acknowledgement on each of Record Rejected / Record
+Dead Letter / Send Alert (retry must not duplicate the row/alert).
 
 Everything is torn down at the end (container removed, mock processes
 killed, temp dirs removed) whether the run passes or fails.
@@ -309,6 +324,7 @@ def main() -> int:
         expected_rejected = 0
         expected_dead_letter = 0
         expected_unknown = 0
+        expected_unknown_committed = 0  # of the above, how many DID commit a CRM write
         expected_accepted_events = 0  # each accepted send is one upsert event
         expected_alert_fired = 0  # accepted sends where the alert sink itself succeeded
 
@@ -456,6 +472,7 @@ def main() -> int:
         http_json("POST", f"{crm}/admin/lookup-outage", {"on": False})
         leads_in += 1
         expected_unknown += 1
+        expected_unknown_committed += 1  # malformed-after-commit-once commits for real
         check(status == 502 and body.get("status") == "outcome_unknown" and body.get("stage") == "crm_response_invalid",
               f"malformed-ack-after-commit + lookup down -> outcome_unknown (status={status}, body={body})")
 
@@ -478,6 +495,74 @@ def main() -> int:
         expected_dead_letter += 1
         check(status == 502 and body.get("status") == "dead_lettered" and body.get("stage") == "crm_response_identity_mismatch",
               f"wrong-contact 200 dead-lettered as crm_response_identity_mismatch, not accepted (status={status}, body={body})")
+
+        # --- 15b. response identity wrong, but the write really DID commit
+        #        under this lead's own idempotency key (unlike A1 above,
+        #        whose mock never writes): reconciliation lookup finds OUR
+        #        OWN identity -> a trustworthy accept, not a dead-lettered
+        #        row on top of a real committed write
+        #        (a8b653d rereview MUST-FIX 1 / 2026-09-27 outcome-recheck
+        #        finding 1: "wrong-identity-after-commit"). ---
+        http_json("POST", f"{crm}/admin/wrong-identity-after-commit-once", {"on": True})
+        status, body = send_lead(env, {"lead_id": "WI1", "name": "Wrong Identity After Commit", "email": "wi1@example.com", "company": "Ambiguous Co"})
+        leads_in += 1
+        expected_accepted_events += 1
+        expected_alert_fired += 1
+        check(status == 200 and body.get("status") == "accepted",
+              f"wrong-identity-after-commit, lookup confirms OUR identity -> accepted, not dead_lettered (status={status}, body={body})")
+
+        # --- 15c. response identity wrong on BOTH the direct write reply
+        #        AND the reconciliation lookup: a record exists under this
+        #        lead's own idempotency key but its identity can never be
+        #        confirmed as this lead's -> outcome_unknown, the write
+        #        accounted for, never dead_lettered as though nothing had
+        #        been written (finding1: "lookup-wrong-identity-after-commit"). ---
+        http_json("POST", f"{crm}/admin/wrong-identity-after-commit-once", {"on": True})
+        http_json("POST", f"{crm}/admin/lookup-wrong-identity-once", {"on": True})
+        status, body = send_lead(env, {"lead_id": "WI2", "name": "Wrong Identity Unresolved", "email": "wi2@example.com", "company": "Ambiguous Co"})
+        leads_in += 1
+        expected_unknown += 1
+        expected_unknown_committed += 1
+        check(status == 502 and body.get("status") == "outcome_unknown" and body.get("stage") == "crm_response_identity_mismatch",
+              f"wrong identity on write AND lookup -> outcome_unknown, not dead_lettered (status={status}, body={body})")
+
+        # --- 15d-15g. finding2: UNKNOWN must be counted per lead EVENT, not
+        #        per email/contact -- reconciliation must hold when the same
+        #        email is updated twice, in either order
+        #        (2026-09-27 outcome-recheck finding 2). ---
+        http_json("POST", f"{crm}/admin/malformed-after-commit-once", {"on": True})
+        http_json("POST", f"{crm}/admin/lookup-outage", {"on": True})
+        status, body = send_lead(env, {"lead_id": "DS1", "name": "Dual Status Unknown First", "email": "dualstatus1@example.com", "company": "Ambiguous Co"})
+        http_json("POST", f"{crm}/admin/lookup-outage", {"on": False})
+        leads_in += 1
+        expected_unknown += 1
+        expected_unknown_committed += 1
+        check(status == 502 and body.get("status") == "outcome_unknown",
+              f"DS1 (unknown-then-accepted, same email): outcome_unknown (status={status}, body={body})")
+
+        status, body = send_lead(env, {"lead_id": "DS2", "name": "Dual Status Accepted Second", "email": "dualstatus1@example.com", "company": "Ambiguous Co"})
+        leads_in += 1
+        expected_accepted_events += 1
+        expected_alert_fired += 1
+        check(status == 200 and body.get("status") == "accepted",
+              f"DS2 (unknown-then-accepted, same email): accepted (status={status}, body={body})")
+
+        status, body = send_lead(env, {"lead_id": "DS3", "name": "Dual Status Accepted First", "email": "dualstatus2@example.com", "company": "Ambiguous Co"})
+        leads_in += 1
+        expected_accepted_events += 1
+        expected_alert_fired += 1
+        check(status == 200 and body.get("status") == "accepted",
+              f"DS3 (accepted-then-unknown, same email): accepted (status={status}, body={body})")
+
+        http_json("POST", f"{crm}/admin/malformed-after-commit-once", {"on": True})
+        http_json("POST", f"{crm}/admin/lookup-outage", {"on": True})
+        status, body = send_lead(env, {"lead_id": "DS4", "name": "Dual Status Unknown Second", "email": "dualstatus2@example.com", "company": "Ambiguous Co"})
+        http_json("POST", f"{crm}/admin/lookup-outage", {"on": False})
+        leads_in += 1
+        expected_unknown += 1
+        expected_unknown_committed += 1
+        check(status == 502 and body.get("status") == "outcome_unknown",
+              f"DS4 (accepted-then-unknown, same email): outcome_unknown (status={status}, body={body})")
 
         # --- 16-18. lost ack on each retried side effect: the node's retry
         #        must be deduped by its record/alert key -> exactly one row. ---
@@ -547,29 +632,64 @@ def main() -> int:
         unknown = state.get("outcome_unknown", [])
         unknown_ids = {u.get("lead_id") for u in unknown}
 
-        actual_upsert_events = sum(c.get("upsert_count", 0) for c in contacts.values() if c.get("lead_id") not in unknown_ids)
-        check(actual_upsert_events == expected_accepted_events,
-              f"CRM upsert events == accepted leads ({actual_upsert_events} == {expected_accepted_events})")
+        # Event-level accounting (2026-09-27 outcome-recheck finding 2). The
+        # CRM's `contacts` collection is aggregated by EMAIL (one row per
+        # email, with a running upsert_count) -- it is not a per-event
+        # ledger keyed by lead/idempotency identity. When the same email
+        # has both an accepted event and an unknown-but-committed event
+        # (DS1-DS4 below), the aggregate's own `lead_id` field only ever
+        # holds the LAST writer, so filtering contacts by "is this contact's
+        # (last) lead_id in unknown_ids" over/under-counts depending on
+        # write order -- that was the exact bug (3 outputs for 2 intakes
+        # one way, 1 for 2 the other). There is no way to split an
+        # aggregate contact's upsert_count back into "how many of these
+        # commits were later classified accepted vs unknown" from final
+        # CRM state alone without a real per-event ledger, so this harness
+        # does not claim to. Instead: (a) unknown and dead-lettered/rejected
+        # counts are exact per EVENT, straight from their own per-event
+        # record arrays; (b) expected_accepted_events/expected_unknown are
+        # incremented once per lead SEND, cross-checked individually
+        # against that send's own HTTP response (not derived from the
+        # aggregate); (c) the aggregate is only used for a COMBINED check
+        # (accepted-writes + unknown-but-committed-writes == total upserts)
+        # that never requires attributing an individual commit to one
+        # status or the other.
+        actual_total_upserts = sum(c.get("upsert_count", 0) for c in contacts.values())
+        expected_committed_writes = expected_accepted_events + expected_unknown_committed
+        check(actual_total_upserts == expected_committed_writes,
+              f"CRM total upsert events (accepted + unknown-but-committed) == expected ({actual_total_upserts} == {expected_committed_writes})")
         check(len(rejected) == expected_rejected, f"rejected records == expected ({len(rejected)} == {expected_rejected})")
         check(len(dead_letter) == expected_dead_letter, f"dead-letter records == expected ({len(dead_letter)} == {expected_dead_letter})")
 
         check(len(unknown) == expected_unknown, f"outcome_unknown records == expected ({len(unknown)} == {expected_unknown})")
+        check(len(unknown) == len({u.get("lead_id") for u in unknown}),
+              "outcome_unknown rows are one per lead EVENT, no lead_id duplicated (no double-counted/dropped event)")
 
-        total_out = actual_upsert_events + len(rejected) + len(dead_letter) + len(unknown)
-        check(total_out == leads_in, f"reconciliation: leads_in ({leads_in}) == upserts+rejected+dead_lettered+unknown ({total_out})")
+        total_out = expected_accepted_events + len(rejected) + len(dead_letter) + len(unknown)
+        check(total_out == leads_in, f"reconciliation: leads_in ({leads_in}) == accepted+rejected+dead_lettered+unknown, counted per event ({total_out})")
 
         # ambiguous writes: each lead has exactly ONE terminal outcome
-        check(unknown_ids == {"UK1"}, f"outcome_unknown rows are exactly UK1 (got {unknown_ids})")
+        check(unknown_ids == {"UK1", "WI2", "DS1", "DS4"}, f"outcome_unknown rows are exactly UK1, WI2, DS1, DS4 (got {unknown_ids})")
         check(contacts.get("uk1@example.com") is not None,
               "UK1's write really did commit (the case is genuinely ambiguous, not a plain failure)")
+        check(contacts.get("wi2@example.com") is not None,
+              "WI2's write really did commit (wrong identity on both write and lookup replies, not proof of non-commit)")
         dl_ids = [d.get("lead_id") for d in dead_letter]
-        for lid in ("AK1", "MA1", "UK1"):
+        for lid in ("AK1", "MA1", "UK1", "WI1", "WI2", "DS1", "DS2", "DS3", "DS4"):
             check(lid not in dl_ids, f"{lid} not also dead-lettered (no double terminal outcome)")
-        for email in ("ak1@example.com", "ma1@example.com"):
+        for email in ("ak1@example.com", "ma1@example.com", "wi1@example.com", "wi2@example.com"):
             c = contacts.get(email)
             check(c is not None and c.get("upsert_count") == 1, f"{email} committed exactly once (upsert_count == 1)")
         check("a@example.com" not in contacts and "other@example.com" not in contacts,
-              "identity-mismatch case wrote no contact")
+              "identity-mismatch case (A1, mock never writes) wrote no contact")
+
+        # finding2: same-email dual-status accounting holds in both orders --
+        # exactly 2 commits recorded on each shared email regardless of
+        # which of its two events landed as unknown vs accepted.
+        for email in ("dualstatus1@example.com", "dualstatus2@example.com"):
+            c = contacts.get(email)
+            check(c is not None and c.get("upsert_count") == 2,
+                  f"{email} upsert_count == 2 (one unknown-but-committed + one accepted event, either order) (got {c.get('upsert_count') if c else None})")
 
         # record/alert idempotency: exactly one row per logical event
         check(sum(1 for r in rejected if r.get("lead_id") == "RR1") == 1, "RR1: exactly one rejected row after ack-lost retry")
@@ -579,7 +699,7 @@ def main() -> int:
         ada = contacts.get("ada@example.com")
         check(ada is not None, "ada@example.com present in CRM contacts")
         check(ada is not None and ada.get("upsert_count") == 2, f"ada@example.com upsert_count == 2 (duplicate collapsed, not duplicated) (got {ada.get('upsert_count') if ada else None})")
-        check(len(contacts) == 10, f"exactly 10 distinct CRM contacts (3 valid + post-outage + idempotent-retry + alert-failure + AK1 + UK1 + MA1 + RA1, dup collapsed) (got {len(contacts)})")
+        check(len(contacts) == 14, f"exactly 14 distinct CRM contacts (3 valid + post-outage + idempotent-retry + alert-failure + AK1 + UK1 + MA1 + RA1 + WI1 + WI2 + 2 dualstatus, dup collapsed) (got {len(contacts)})")
 
         # idempotent-retry lead: the lost-ack retry must NOT have double-committed
         idem = contacts.get("idem@example.com")
@@ -610,9 +730,11 @@ def main() -> int:
         fired = alerts(env)
         alert_lead_ids = {a.get("lead_id") for a in fired}
         check(len(fired) == expected_alert_fired, f"alert fired exactly where notification succeeded ({len(fired)} == {expected_alert_fired})")
-        check(alert_lead_ids == {"L1", "L2", "L3", "L1-DUP", "L4", "ID1", "AK1", "MA1", "RA1"}, f"alerts fired for exactly the notification-succeeded lead_ids (got {alert_lead_ids})")
+        check(alert_lead_ids == {"L1", "L2", "L3", "L1-DUP", "L4", "ID1", "AK1", "MA1", "RA1", "WI1", "DS2", "DS3"}, f"alerts fired for exactly the notification-succeeded lead_ids (got {alert_lead_ids})")
         check("AL1" not in alert_lead_ids, "AL1 (alert-outage lead) never recorded a successful alert")
         check("A1" not in alert_lead_ids and "UK1" not in alert_lead_ids, "no accepted notification for identity-mismatch (A1) or unknown (UK1)")
+        check("WI2" not in alert_lead_ids and "DS1" not in alert_lead_ids and "DS4" not in alert_lead_ids,
+              "no accepted notification for the other unknown cases (WI2, DS1, DS4)")
         check(sum(1 for a in fired if a.get("lead_id") == "RA1") == 1, "RA1: exactly one alert after ack-lost retry")
 
     finally:

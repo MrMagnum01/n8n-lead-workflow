@@ -68,6 +68,16 @@ write durably, then answers 200 {} -- the ambiguous case where the
 workflow cannot tell from the reply whether anything was written.
 POST /admin/wrong-identity-once answers the next /contacts write with a
 well-formed 200 for a DIFFERENT contact (lead_id OTHER) without writing.
+POST /admin/wrong-identity-after-commit-once performs the next /contacts
+write for real (committed and cached under its idempotency key, same as
+any normal write) but answers THAT request with a well-formed 200 for a
+DIFFERENT contact (lead_id OTHER) -- the ack is corrupted, not the write.
+Models the genuinely ambiguous case: a write really did commit under the
+caller's own key, and only the identity in the reply is wrong.
+POST /admin/lookup-wrong-identity-once answers the next successful
+/contacts/lookup (one that would otherwise find a real committed record)
+with a well-formed but WRONG contact identity instead of the true cached
+one -- the reconciliation lookup's own reply is corrupted this time.
 
 Reconciliation: GET /contacts/lookup?idempotency_key=K answers
 {"found": true, "contact": {...}} if a write under K committed, else
@@ -113,6 +123,8 @@ RECORDING_OUTAGE = {"on": False}
 DROP_REPLY_COUNT = {"n": 0}
 MALFORMED_AFTER_COMMIT_ONCE = {"armed": False}
 WRONG_IDENTITY_ONCE = {"armed": False}
+WRONG_IDENTITY_AFTER_COMMIT_ONCE = {"armed": False}
+LOOKUP_WRONG_IDENTITY_ONCE = {"armed": False}
 LOOKUP_OUTAGE = {"on": False}
 DROP_RECORD_REPLY_ONCE: dict = {}  # path -> True
 RECORD_COLLECTIONS = {"/rejected": "rejected", "/dead-letter": "dead_letter", "/outcome-unknown": "outcome_unknown"}
@@ -199,6 +211,9 @@ class Handler(BaseHTTPRequestHandler):
             prior = state["idempotency"].get(key) if key else None
             if prior is None:
                 self._send_json(200, {"found": False})
+            elif LOOKUP_WRONG_IDENTITY_ONCE["armed"]:
+                LOOKUP_WRONG_IDENTITY_ONCE["armed"] = False
+                self._send_json(200, {"found": True, "contact": {"email": "other@example.com", "lead_id": "OTHER"}})
             else:
                 self._send_json(200, {"found": True, "contact": prior["response"]["contact"]})
         elif self.path == "/contacts":
@@ -243,6 +258,8 @@ class Handler(BaseHTTPRequestHandler):
             RECORDING_OUTAGE["on"] = False
             MALFORMED_AFTER_COMMIT_ONCE["armed"] = False
             WRONG_IDENTITY_ONCE["armed"] = False
+            WRONG_IDENTITY_AFTER_COMMIT_ONCE["armed"] = False
+            LOOKUP_WRONG_IDENTITY_ONCE["armed"] = False
             LOOKUP_OUTAGE["on"] = False
             DROP_RECORD_REPLY_ONCE.clear()
             self._send_json(200, {"reset": True})
@@ -261,6 +278,16 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json()
             WRONG_IDENTITY_ONCE["armed"] = bool(body.get("on", True))
             self._send_json(200, {"armed": WRONG_IDENTITY_ONCE["armed"]})
+            return
+        if self.path == "/admin/wrong-identity-after-commit-once":
+            body = self._read_json()
+            WRONG_IDENTITY_AFTER_COMMIT_ONCE["armed"] = bool(body.get("on", True))
+            self._send_json(200, {"armed": WRONG_IDENTITY_AFTER_COMMIT_ONCE["armed"]})
+            return
+        if self.path == "/admin/lookup-wrong-identity-once":
+            body = self._read_json()
+            LOOKUP_WRONG_IDENTITY_ONCE["armed"] = bool(body.get("on", True))
+            self._send_json(200, {"armed": LOOKUP_WRONG_IDENTITY_ONCE["armed"]})
             return
         if self.path == "/admin/lookup-outage":
             body = self._read_json()
@@ -354,6 +381,8 @@ class Handler(BaseHTTPRequestHandler):
                     drop_this_reply = True
                 malformed_reply = MALFORMED_AFTER_COMMIT_ONCE["armed"]
                 MALFORMED_AFTER_COMMIT_ONCE["armed"] = False
+                wrong_identity_reply = WRONG_IDENTITY_AFTER_COMMIT_ONCE["armed"]
+                WRONG_IDENTITY_AFTER_COMMIT_ONCE["armed"] = False
 
             if drop_this_reply:
                 # The write above is already committed and (if an
@@ -364,6 +393,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if malformed_reply:
                 self._send_json(200, {})  # write committed; reply garbled
+                return
+            if wrong_identity_reply:
+                # Write above is genuinely committed under the caller's own
+                # idempotency key (and correctly cached for it); only THIS
+                # reply is swapped for a different contact's identity.
+                self._send_json(200, {"status": "ok", "contact": {"email": "other@example.com", "lead_id": "OTHER"}})
                 return
 
             self._send_json(200, response)
